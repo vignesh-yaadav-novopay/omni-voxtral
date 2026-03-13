@@ -34,7 +34,8 @@ class VoxtralTrainConfig(BaseConfig):
     mistral_pretrained_path: str = "nilq/mistral-1L-tiny"  # "mistralai/Mistral-7B-v0.3"
     mistral_kwargs: dict = {}
     voxtral_tokenizer_config: VoxtralTokenizerConfig = VoxtralTokenizerConfig()
-    new_vocab_size: int = 2**16
+    # text_vocab_size + num_codebooks * codebook_size = 65536 + 8*2048 = 81920
+    new_vocab_size: int = 81920
     loss_weights: list[int] = [100, 10, 1]  # text, semantic, acoustic
     lora_rank: int | None = None
     prune_layers: int | None = None  # no layer dropout
@@ -64,17 +65,24 @@ class VoxtralTrainConfig(BaseConfig):
     grad_norm: float = 1.0
     warmup_steps: int = 100
     max_steps: int = 500
+    gradient_accumulation_steps: int = 1
 
     ## test
     test_every: int | None = 10
     generate_kwargs: dict = {}
 
     ## logging and checkpointing
+    log_every: int = 50
     watch_every: int | None = None
     ckpt_path: str | None = None
     save_every: int | None = None
     push_every: int | None = None
+    keep_checkpoints: int = 5
     wandb_project_name: str = "voxtral"
+
+    ## model architecture toggles
+    dual_stream: bool = False
+    language_adapters: bool = False
 
     ## dist (picked up by env)
     rank: int = 0

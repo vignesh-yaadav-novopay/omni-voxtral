@@ -13,10 +13,12 @@ dotenv.load_dotenv()
 
 class VoxtralTokenizerConfig(typing.NamedTuple):
     mimi_path: str = "kyutai/mimi"
-    whisper_path: str = "openai/whisper-tiny.en"
+    whisper_path: str = "openai/whisper-large-v3"
     text_hz: int = 5
-    mimi_num_quantizers: int = 4
-    text_vocab_size: int = 32768
+    mimi_num_quantizers: int = 8
+    text_vocab_size: int = 65536
+    language: str = "en"
+    sp_tokenizer_path: str | None = None  # Path to SentencePiece .model file
 
 
 def interleave(*seqs: list[torch.Tensor], factors: list[int]):
@@ -56,7 +58,12 @@ class VoxtralTokenizer(torch.nn.Module):
         )
 
         # whisper
-        self.whisper = TimedWhisperTokenizer(config.whisper_path, hertz=config.text_hz)
+        self.whisper = TimedWhisperTokenizer(
+            config.whisper_path,
+            hertz=config.text_hz,
+            language=config.language,
+            sp_tokenizer_path=config.sp_tokenizer_path,
+        )
 
     @property
     def device(self) -> torch.device:

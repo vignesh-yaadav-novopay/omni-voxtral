@@ -162,14 +162,25 @@ cython_debug/
 #.idea/
 #
 
-*.webm 
-*.m4a 
-*.mp3 
+*.webm
+*.m4a
+*.mp3
 *.wav
 urls.txt
 data/chunks/
 data/tokens
 *.part
-*.part
-*.part
-*.part
+
+# Auto-research shared memory (NEVER commit — survives git resets)
+autoresearch/memory/research_log.md
+autoresearch/memory/results.tsv
+autoresearch/memory/theory_findings.md
+autoresearch/memory/training_insights.md
+autoresearch/memory/experiment_queue.md
+autoresearch/memory/research_questions.md
+autoresearch/memory/papers/
+autoresearch/run.log
+
+# Logs and wandb
+logs/
+wandb/

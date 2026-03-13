@@ -161,40 +161,92 @@ def separate_into_buckets(
 
 
 def generate_tokens(
-    processor: typing.Any, model: typing.Any, audio: torch.Tensor
+    processor: typing.Any,
+    model: typing.Any,
+    audio: torch.Tensor,
+    language: str = "en",
 ) -> dict[str, typing.Any]:
     device = next(model.parameters()).device
     input_features = processor(
         audio.numpy(), sampling_rate=16000, return_tensors="pt"
     ).input_features.to(device, audio.dtype)
-    return model.generate(
-        input_features, return_timestamps=True, return_token_timestamps=True
-    )
+    generate_kwargs: dict[str, typing.Any] = {
+        "return_timestamps": True,
+        "return_token_timestamps": True,
+    }
+    if language != "en":
+        generate_kwargs["language"] = language
+        generate_kwargs["task"] = "transcribe"
+    return model.generate(input_features, **generate_kwargs)
 
 
 class TimedWhisperTokenizer(torch.nn.Module):
-    def __init__(self, model_name: str, hertz: int) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        hertz: int,
+        language: str = "en",
+        sp_tokenizer_path: str | None = None,
+    ) -> None:
         super().__init__()
         self.processor = tr.WhisperProcessor.from_pretrained(model_name)
         self.model = tr.WhisperForConditionalGeneration.from_pretrained(model_name)
 
-        self.language: str = "en"
+        self.language: str = language
         self.tokenizer: typing.Any = self.processor.tokenizer  # type: ignore
         self.hertz: int = hertz
 
-        self.mistral_tokenizer: tr.AutoTokenizer = tr.AutoTokenizer.from_pretrained(
-            "mistralai/Mistral-7B-Instruct-v0.3",
-            padding_side="right",
-            add_prefix_space=False,
-        )
-        self.mistral_tokenizer.pad_token = self.mistral_tokenizer.eos_token
+        # Use SentencePiece tokenizer if provided, otherwise fall back to Mistral BPE
+        self.sp_tokenizer = None
+        if sp_tokenizer_path is not None:
+            import sentencepiece as spm
+
+            self.sp_tokenizer = spm.SentencePieceProcessor()
+            self.sp_tokenizer.Load(sp_tokenizer_path)
+        else:
+            self.mistral_tokenizer: tr.AutoTokenizer = (
+                tr.AutoTokenizer.from_pretrained(
+                    "mistralai/Mistral-7B-Instruct-v0.3",
+                    padding_side="right",
+                    add_prefix_space=False,
+                )
+            )
+            self.mistral_tokenizer.pad_token = self.mistral_tokenizer.eos_token
+
+    def _tokenize_bucket(self, texts: list[str], device: torch.device) -> torch.Tensor:
+        """Tokenize a list of bucket texts, padding/truncating to self.hertz tokens each."""
+        if self.sp_tokenizer is not None:
+            # SentencePiece path: encode each text, pad/truncate to hertz
+            pad_id = self.sp_tokenizer.pad_id()
+            if pad_id < 0:
+                pad_id = 0  # fallback to <pad> at ID 0
+            all_ids = []
+            for text in texts:
+                ids = self.sp_tokenizer.Encode(text)
+                # Truncate or pad to exactly self.hertz tokens
+                ids = ids[: self.hertz]
+                ids = ids + [pad_id] * (self.hertz - len(ids))
+                all_ids.append(ids)
+            return torch.tensor(all_ids, dtype=torch.long, device=device)
+        else:
+            tokens = self.mistral_tokenizer(
+                texts,
+                padding="max_length",
+                max_length=self.hertz,
+                truncation=True,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
+            return tokens["input_ids"].to(device)
 
     def forward(self, audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
         assert sample_rate == 16000, "Sample rate must be 16000"
         assert audio.ndim == 2, "Audio must be 2D, batch x time"
         total_duration = audio.shape[1] / sample_rate
 
-        outputs = generate_tokens(self.processor, self.model, audio)
+        outputs = generate_tokens(
+            self.processor, self.model, audio, language=self.language
+        )
         device = outputs["sequences"].device
         alignment = tokens_to_words(outputs, self.tokenizer, self.language)
         [merge_punctuations(a) for a in alignment]
@@ -204,14 +256,7 @@ class TimedWhisperTokenizer(torch.nn.Module):
                 a, bucket_size=1.0, total_duration=total_duration
             )
             out = [clean_text(" ".join(b)) for b in out]
-            tokens = self.mistral_tokenizer(  # type: ignore
-                out,
-                padding="max_length",
-                max_length=self.hertz,
-                truncation=True,
-                return_tensors="pt",
-                add_special_tokens=False,
-            )
-            buckets.append(tokens["input_ids"])
+            bucket_tokens = self._tokenize_bucket(out, device)
+            buckets.append(bucket_tokens)
         buckets = torch.stack(buckets).view(len(buckets), -1).to(device)
         return buckets

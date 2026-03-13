@@ -110,6 +110,10 @@ def unwrap_model(
         model = model._orig_mod
     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
         model = model.module
+    # FSDP: access the wrapped module
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    if isinstance(model, FSDP):
+        model = model._fsdp_wrapped_module
     return model
 
 

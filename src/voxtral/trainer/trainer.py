@@ -164,15 +164,58 @@ def prepare_batch(batch: dict, device: torch.device) -> torch.Tensor:
 
 
 def compute_loss(
-    voxtral: Voxtral | DistributedDataParallel, x: torch.Tensor
+    voxtral: Voxtral | DistributedDataParallel,
+    x: torch.Tensor,
+    config: VoxtralTrainConfig,
 ) -> torch.Tensor:
     input_ids = x[:, :-1].contiguous()  # Input sequence, excluding the last token
     target_ids = x[:, 1:].contiguous()  # Target sequence, excluding the first token
     outputs = voxtral(input_ids=input_ids)
     logits = outputs.logits
-    return torch.nn.functional.cross_entropy(
-        logits.view(-1, logits.size(-1)).float(), target_ids.view(-1)
+
+    # Build per-token loss weights based on token type.
+    # The interleaving pattern from model.py uses factors=[1, text_to_audio_factor]:
+    #   [1 text token, N audio tokens] repeating, where N = frame_rate * num_q / text_hz
+    # Within audio tokens, codebooks cycle every num_q positions:
+    #   audio_pos % num_q == 0 → semantic (1st codebook, WavLM-distilled)
+    #   audio_pos % num_q != 0 → acoustic (codebooks 2-8)
+    text_w, semantic_w, acoustic_w = config.loss_weights
+    num_q = config.voxtral_tokenizer_config.mimi_num_quantizers
+    text_hz = config.voxtral_tokenizer_config.text_hz
+    # text_to_audio_factor = frame_rate * num_q / text_hz (computed in VoxtralTokenizer)
+    # Mimi frame_rate is 12.5 Hz
+    text_to_audio_factor = int(12.5 * num_q / text_hz)  # 20 for 8q/5Hz
+    stride = 1 + text_to_audio_factor  # 21
+
+    # Create weight pattern for one interleaving period
+    pattern = torch.zeros(stride, device=logits.device, dtype=logits.dtype)
+    pattern[0] = text_w  # text token
+    for i in range(1, stride):
+        audio_idx = i - 1
+        if audio_idx % num_q == 0:
+            pattern[i] = semantic_w   # 1st codebook (semantic)
+        else:
+            pattern[i] = acoustic_w   # codebooks 2-8 (acoustic)
+
+    # Tile pattern across sequence length
+    seq_len = target_ids.size(1)
+    repeats = (seq_len + stride - 1) // stride
+    weights = pattern.repeat(repeats)[:seq_len]
+
+    # Normalize so mean weight is 1.0 (preserves loss scale)
+    weights = weights / weights.mean()
+
+    # Compute per-token cross entropy
+    per_token_loss = torch.nn.functional.cross_entropy(
+        logits.view(-1, logits.size(-1)).float(),
+        target_ids.view(-1),
+        reduction="none",
     )
+
+    # Apply weights across batch: expand weights to match flattened (batch*seq) shape
+    batch_size = target_ids.size(0)
+    weighted_loss = per_token_loss * weights.repeat(batch_size)
+    return weighted_loss.mean()
 
 
 def train_step(
@@ -181,7 +224,7 @@ def train_step(
     device = utils.get_device()
     x = prepare_batch(batch, device)
 
-    loss = compute_loss(state.model, x=x)
+    loss = compute_loss(state.model, x=x, config=config)
 
     state.optimizer.zero_grad()
     loss.backward()
