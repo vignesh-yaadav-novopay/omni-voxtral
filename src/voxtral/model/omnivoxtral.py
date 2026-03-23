@@ -44,6 +44,7 @@ class OmniVoxtralConfig:
         depth_num_layers: int = 6,
         depth_dim: int = 1024,
         depth_num_heads: int = 16,
+        depth_dropout: float = 0.0,
         # Audio config
         num_codebooks: int = 8,
         codebook_size: int = 2048,
@@ -65,6 +66,7 @@ class OmniVoxtralConfig:
         self.depth_num_layers = depth_num_layers
         self.depth_dim = depth_dim
         self.depth_num_heads = depth_num_heads
+        self.depth_dropout = depth_dropout
 
         self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size
@@ -116,6 +118,8 @@ class OmniVoxtral(nn.Module):
             use_cache=False,
             eos_token_id=99999,
             output_hidden_states=False,
+            low_cpu_mem_usage=True,     # shard-by-shard loading (1x RAM, not 2x)
+            torch_dtype=torch.bfloat16,  # 7GB for 7B model instead of 14GB
             **config.temporal_kwargs,
         )
         self.temporal.resize_token_embeddings(config.new_vocab_size)
@@ -153,6 +157,7 @@ class OmniVoxtral(nn.Module):
             num_codebooks=config.num_codebooks,
             codebook_size=config.codebook_size,
             temporal_dim=self.temporal_dim,
+            dropout=config.depth_dropout,
         )
         self.depth = DepthTransformer(depth_config)
 
@@ -170,14 +175,14 @@ class OmniVoxtral(nn.Module):
         is_peft = hasattr(self.temporal, "peft_type")
 
         if is_peft:
-            # PEFT wrapping changes .model attribute semantics.
-            # Call through PEFT's forward to ensure LoRA adapters are active.
-            temporal_out = self.temporal(
-                input_ids=input_ids,
-                output_hidden_states=True,
-            )
-            temporal_logits = temporal_out.logits
-            temporal_hidden = temporal_out.hidden_states[-1]
+            # PEFT wrapping: access the underlying model directly via
+            # base_model.model.model() to get only the last hidden state.
+            # This avoids output_hidden_states=True which materializes ALL
+            # intermediate layers (~394MB wasted for 16L 7B). Verified:
+            # LoRA adapters remain active and results are identical (AF-101).
+            base_out = self.temporal.base_model.model.model(input_ids=input_ids)
+            temporal_hidden = base_out.last_hidden_state
+            temporal_logits = self.temporal.base_model.model.lm_head(temporal_hidden)
         else:
             # Standard model — efficient path: only last hidden state materialized.
             base_out = self.temporal.model(input_ids=input_ids)

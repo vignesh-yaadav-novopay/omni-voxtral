@@ -119,22 +119,27 @@ def unwrap_model(
 
 @general_exception_handler
 def _save_checkpoint(
-    checkpoint: dict[str, typing.Any], step: int, run_id: str, push: bool = False
+    checkpoint: dict[str, typing.Any], step: int, run_id: str, push: bool = False,
+    keep: int = 1,
 ) -> None:
-    """serializes a dict to the logs directory with torch, only keeps 5 most recent checkpoints in dir"""
+    """Atomic checkpoint save. Writes to temp file, then renames. Never loses the old checkpoint."""
     log_dir = os.path.join(os.path.join(os.getcwd(), "logs"), run_id)
     os.makedirs(log_dir, exist_ok=True)
+
     checkpoint_path = os.path.join(log_dir, f"checkpoint_{step}.pt")
-    torch.save(checkpoint, checkpoint_path)
+    tmp_path = checkpoint_path + ".tmp"
 
+    # Save to temp file first (if interrupted, old checkpoint survives)
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, checkpoint_path)  # atomic on POSIX
+
+    # Now safe to delete old checkpoints
     checkpoint_files = glob.glob(os.path.join(log_dir, "checkpoint_*.pt"))
-
     def get_step_number(filename):
         match = re.search(r"checkpoint_(\d+)\.pt", filename)
         return int(match.group(1)) if match else -1
-
     checkpoint_files.sort(key=get_step_number, reverse=True)
-    for old_checkpoint in checkpoint_files[5:]:
+    for old_checkpoint in checkpoint_files[keep:]:
         os.remove(old_checkpoint)
 
     pprint(f"saved state in path {checkpoint_path}", color="bold yellow")

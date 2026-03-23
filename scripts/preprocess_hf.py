@@ -92,7 +92,10 @@ def extract_audio(sample: dict, dataset_name: str) -> tuple[np.ndarray, int] | N
             audio = sample["audio"]
             return audio["array"], audio["sampling_rate"]
         elif dataset_name == "indicvoices":
-            audio = sample["audio"]
+            # IndicVoices uses "audio_filepath" key, not "audio"
+            audio = sample.get("audio_filepath") or sample.get("audio")
+            if audio is None:
+                return None
             return audio["array"], audio["sampling_rate"]
         return None
     except Exception as e:

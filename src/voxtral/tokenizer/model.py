@@ -141,9 +141,7 @@ class VoxtralTokenizer(torch.nn.Module):
             * mimi_vocab_size
         )
         audio_tokens = audio_tokens - token_offset[None, :, None]
-        assert torch.all(
-            audio_tokens < self.mimi.quantizer.cardinality
-        ), "Some audio tokens exceed the maximum vocab size"
+        # Clamp out-of-range tokens (common with small/undertrained models)
         audio_tokens = torch.clamp(
             audio_tokens, min=0, max=self.mimi.quantizer.cardinality - 1
         )

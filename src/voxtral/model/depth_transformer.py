@@ -111,10 +111,11 @@ class DepthTransformerLayer(nn.Module):
         self.attn = DepthAttention(config)
         self.ffn_norm = RMSNorm(config.dim)
         self.ffn = DepthFeedForward(config)
+        self.dropout = nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x))
-        x = x + self.ffn(self.ffn_norm(x))
+        x = x + self.dropout(self.attn(self.attn_norm(x)))
+        x = x + self.dropout(self.ffn(self.ffn_norm(x)))
         return x
 
 
@@ -233,8 +234,15 @@ class DepthTransformer(nn.Module):
 
         if codebook_tokens is not None:
             # Teacher forcing: use ground truth tokens
+            # Optional: randomly corrupt tokens to mitigate exposure bias
+            if self.training and hasattr(self, '_mask_rate') and self._mask_rate > 0:
+                mask = torch.rand(batch_size, num_q - 1, device=codebook_tokens.device) < self._mask_rate
+                random_tokens = torch.randint(0, self.config.codebook_size, (batch_size, num_q - 1), device=codebook_tokens.device)
+                cb_input = torch.where(mask, random_tokens, codebook_tokens[:, :num_q - 1])
+            else:
+                cb_input = codebook_tokens[:, :num_q - 1]
             for i in range(num_q - 1):
-                tok_emb = self.codebook_embeddings[i](codebook_tokens[:, i])
+                tok_emb = self.codebook_embeddings[i](cb_input[:, i])
                 seq.append(tok_emb.unsqueeze(1))
 
         # Concatenate: (batch, num_positions, dim)

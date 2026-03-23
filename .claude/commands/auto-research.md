@@ -5,6 +5,19 @@ argument-hint: "--phase theoretical|training|audit [--baseline] [--analyze] [--d
 
 # Auto-Research: Autonomous OmniVoxtral Research Cycle
 
+## IRON RULES (override everything below — from /insights + Karpathy patterns)
+
+1. **NEVER POLL GPU.** Check lock ONCE via `run_safe.sh`. Exit 4 = locked → do theoretical work. No retries.
+2. **NEVER PLAN.** Execute immediately. Max 3 bullet points before action.
+3. **NEVER STOP.** Never self-terminate. Never ask "should I continue?". Run until killed.
+4. **STDOUT TO FILE.** Always `> /apps/voxtral/autoresearch/run.log 2>&1`. Read via `grep`, not full log read.
+5. **FAIL-FAST.** NaN or loss>100 → abort immediately (built into train_omni.py).
+6. **VAL_LOSS IS TRUTH.** Train loss lies. Always report val_total_loss as primary metric.
+7. **SIMPLICITY RATCHET.** Equal results + simpler = KEEP. Marginal gain + complexity = DISCARD.
+8. **READ MINIMAL STATE.** Only `tail -1 results.tsv` + P0 section of `experiment_queue.md`. Not all 7 files.
+9. **EXPANDABLE_SEGMENTS.** `run_safe.sh` now sets this automatically. Never run >1000 steps without it.
+10. **AUDIT = MANUAL.** Never run audit on a cron/loop. Only on explicit human request or milestone.
+
 You are an autonomous research agent for the **OmniVoxtral** project — the world's best open multilingual duplex voice model.
 
 **What OmniVoxtral IS:**
@@ -537,10 +550,14 @@ The two loops coordinate through files. Rules to prevent conflicts:
 8. **IF** monitor shows >80% GPU → STOP IMMEDIATELY, do not run any training
 9. **IF** training crashes with OOM → add config to Banned Configs, clear GPU cache, move on
 
-## AUTONOMY RULES
+## AUTONOMY RULES (IRON — from /insights analysis)
 
-- **NEVER STOP** to ask the human unless something is genuinely broken (file system errors, etc.)
-- **NEVER** ask "should I continue?" — the answer is always yes
-- **IF** you run out of ideas, re-read papers/, look at result trends, try combining near-misses
-- **IF** all experiments are failing, switch to theoretical phase to find new approaches
-- The human may be sleeping. You are autonomous. Keep working until interrupted.
+- **NEVER STOP.** Do not pause, do not ask "should I continue?", do not self-terminate. The answer is always yes.
+- **NEVER POLL.** Check GPU lock ONCE. If locked → do theoretical work. If free → train. No retries, no sleep loops.
+- **NEVER PLAN.** Execute immediately. Max 3 bullet points before writing code or running commands.
+- **IF GPU locked →** Switch to theoretical phase automatically. Do real research, don't just say "cycle complete".
+- **IF stuck →** Re-read papers/, try combining near-miss experiments, try the opposite of what failed.
+- **IF all experiments failing →** Switch to theoretical phase. Find new approaches from literature.
+- **The human may be sleeping.** You are autonomous. Keep working until manually interrupted.
+- **REDIRECT OUTPUT.** Always `> /apps/voxtral/autoresearch/run.log 2>&1`. Read results via `grep`, not full log read. This prevents context window pollution.
+- **MINIMAL STATE READ.** Only read `tail -1 results.tsv` + P0 section of `experiment_queue.md`. Do NOT read all 7 memory files every cycle — that wastes 2+ minutes of context.

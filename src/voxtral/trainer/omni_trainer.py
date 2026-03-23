@@ -29,6 +29,7 @@ class OmniTrainState:
     optimizer: torch.optim.AdamW  # type: ignore
     scheduler: torch.optim.lr_scheduler.LRScheduler  # type: ignore
     train_dataset: VoxtralDataset
+    val_dataset: VoxtralDataset | None = None
 
 
 def extract_codebook_targets(
@@ -195,10 +196,29 @@ def compute_omni_loss(
     cb_targets_local = outputs["cb_targets_local"]
     codebook_size = omni.config.codebook_size
 
-    depth_loss = F.cross_entropy(
-        depth_logits.reshape(-1, codebook_size).float(),
-        cb_targets_local.reshape(-1),
-    )
+    # Per-codebook weighted depth loss (Moshi §4.4: α_semantic=100, α_acoustic=1)
+    num_q = cb_targets_local.size(-1)
+    label_smoothing = config.depth_label_smoothing
+    per_q_losses = []
+    for q in range(num_q):
+        q_loss = F.cross_entropy(
+            depth_logits[:, :, q].reshape(-1, codebook_size).float(),
+            cb_targets_local[:, :, q].reshape(-1),
+            label_smoothing=label_smoothing,
+        )
+        per_q_losses.append(q_loss)
+    per_q_losses = torch.stack(per_q_losses)
+    if config.depth_q_weights is not None:
+        q_weights = torch.tensor(config.depth_q_weights[:num_q], device=depth_logits.device)
+    else:
+        q_weights = torch.ones(num_q, device=depth_logits.device)
+        q_weights[0] = 100.0  # semantic codebook gets 100x weight (Moshi §4.4)
+    # RVQ structured dropout: randomly zero out codebook losses (never drop q0/semantic)
+    if omni.training and config.depth_q_dropout > 0 and num_q > 1:
+        drop_mask = torch.rand(num_q, device=depth_logits.device) > config.depth_q_dropout
+        drop_mask[0] = True  # never drop semantic codebook
+        q_weights = q_weights * drop_mask.float()
+    depth_loss = (per_q_losses * q_weights).sum() / q_weights.sum().clamp(min=1e-8)
 
     # Combined loss: Moshi uses equal weighting
     total_loss = temporal_loss + depth_loss
@@ -244,19 +264,31 @@ def omni_train_step(
     stats: dict[str, float],
     config: VoxtralTrainConfig,
 ) -> tuple[OmniTrainState, dict[str, float]]:
-    """Single training step for OmniVoxtral."""
+    """Single training step for OmniVoxtral.
+
+    Supports gradient accumulation: accumulates gradients over
+    `config.gradient_accumulation_steps` micro-steps before updating weights.
+    """
     device = utils.get_device()
     x = batch["tokens"].to(device)
+    accum_steps = config.gradient_accumulation_steps
 
     losses = compute_omni_loss(state.model, x=x, config=config)
 
-    state.optimizer.zero_grad()
-    losses["total_loss"].backward()
-    grad_norm = torch.nn.utils.clip_grad_norm_(
-        state.model.parameters(), config.grad_norm
-    )
-    state.optimizer.step()
-    state.scheduler.step()
+    # Scale loss by accumulation steps so gradients average correctly
+    scaled_loss = losses["total_loss"] / accum_steps
+    scaled_loss.backward()
+
+    # Only step optimizer every accum_steps micro-steps
+    if state.step % accum_steps == 0:
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            state.model.parameters(), config.grad_norm
+        )
+        state.optimizer.step()
+        state.scheduler.step()
+        state.optimizer.zero_grad()
+    else:
+        grad_norm = torch.tensor(0.0)
 
     # Accumulate stats
     stats["count"] += 1
