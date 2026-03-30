@@ -185,3 +185,20 @@ autoresearch/run.log
 # Logs and wandb
 logs/
 wandb/
+
+# Large data directories (audio chunks, tokens, checkpoints)
+data/chunks*/
+data/tokens*/
+data/yt_*/
+data/chunks_indic*/
+best_checkpoints/
+*.npy
+*.pt
+*.flac
+*.ogg
+
+# Session files
+session-*.md
+
+# Claude internal
+.claude/scheduled_tasks.lock

@@ -96,6 +96,7 @@ class VoxtralTrainConfig(BaseConfig):
     depth_mask_rate: float = 0.0  # exposure bias fix: randomly corrupt this fraction of teacher-forced tokens
     depth_q_weights: list[float] | None = None  # per-codebook loss weights (default: [100,1,1,1,1,1,1,1])
     depth_q_dropout: float = 0.0  # RVQ structured dropout: probability of dropping each codebook loss (0.3 = 30% chance)
+    depth_focal_gamma: float = 0.0  # focal loss gamma for depth CE (0=disabled, 2.0=recommended). Focuses gradient on hard tokens.
 
     ## dist (picked up by env)
     rank: int = 0

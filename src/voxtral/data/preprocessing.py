@@ -58,7 +58,12 @@ class AudioChunkDataset(Dataset):
 
     def __getitem__(self, idx):
         file_path = self.file_list[idx]
-        waveform, sample_rate = torchaudio.load(file_path)
+        try:
+            waveform, sample_rate = torchaudio.load(file_path)
+        except Exception:
+            # Return silence for corrupted files
+            waveform = torch.zeros(self.num_channels, self.chunk_frames, dtype=self.dtype)
+            sample_rate = self.target_sample_rate
 
         if sample_rate != self.target_sample_rate:
             resampler = torchaudio.transforms.Resample(
@@ -124,11 +129,19 @@ def preprocess_audio_chunks(config: PreprocessingConfig):
 
     save_executor = ThreadPoolExecutor(max_workers=config.max_save_workers)
 
+    skipped = 0
     for batch in tqdm(dataloader, desc="Processing audio chunks"):
         waveforms, filenames = batch
-        encoded = tokenizer.encode(waveforms, 24_000)
+        try:
+            encoded = tokenizer.encode(waveforms, 24_000)
+        except Exception as e:
+            skipped += len(filenames)
+            print(f"Skipped {len(filenames)} files due to error: {e}")
+            continue
         for z, filename in zip(encoded, filenames):
             save_executor.submit(_save_tokens, z, filename, config.output_path)
+    if skipped:
+        print(f"Total skipped: {skipped} files")
 
     save_executor.shutdown(wait=True)
 

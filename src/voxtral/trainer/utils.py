@@ -176,6 +176,8 @@ def update_ema_karras_(
         if k.startswith("module."):
             k = k.replace("module.", "")
 
+        if k not in ema_params:
+            continue
         ema_params[k].mul_(BETA).add_(v.to(ema_device), alpha=1 - BETA)
 
         if log_key is not None and k == log_key:

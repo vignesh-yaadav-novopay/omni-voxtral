@@ -200,12 +200,23 @@ def compute_omni_loss(
     num_q = cb_targets_local.size(-1)
     label_smoothing = config.depth_label_smoothing
     per_q_losses = []
+    focal_gamma = config.depth_focal_gamma
     for q in range(num_q):
-        q_loss = F.cross_entropy(
-            depth_logits[:, :, q].reshape(-1, codebook_size).float(),
-            cb_targets_local[:, :, q].reshape(-1),
-            label_smoothing=label_smoothing,
-        )
+        if focal_gamma > 0:
+            ce = F.cross_entropy(
+                depth_logits[:, :, q].reshape(-1, codebook_size).float(),
+                cb_targets_local[:, :, q].reshape(-1),
+                label_smoothing=label_smoothing,
+                reduction="none",
+            )
+            pt = torch.exp(-ce)
+            q_loss = ((1 - pt) ** focal_gamma * ce).mean()
+        else:
+            q_loss = F.cross_entropy(
+                depth_logits[:, :, q].reshape(-1, codebook_size).float(),
+                cb_targets_local[:, :, q].reshape(-1),
+                label_smoothing=label_smoothing,
+            )
         per_q_losses.append(q_loss)
     per_q_losses = torch.stack(per_q_losses)
     if config.depth_q_weights is not None:

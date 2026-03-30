@@ -1,5 +1,7 @@
 import hashlib
 import os
+import random
+import re
 import subprocess
 import typing
 import uuid
@@ -16,6 +18,17 @@ class ScrapingConfig(pyds.BaseSettings):
     chunk_duration: int = 20
     max_workers: int = 64
     format: str = "bestaudio[ext=m4a]/best[ext=mp4]/bestaudio/best"
+    proxy_url: str = ""  # e.g. http://USER-res-in:PASS@gw.netnut.net:5959
+
+
+def sticky_proxy(proxy_url: str) -> str:
+    """Add a random session ID to the proxy URL for IP stickiness."""
+    if not proxy_url:
+        return ""
+    sid = random.randint(100000000, 999999999)
+    # Insert -sid-XXXXXXX before the colon separating user:pass
+    # e.g. http://trustt-res-in:pass@host -> http://trustt-res-in-sid-123456789:pass@host
+    return re.sub(r"(://[^:]+)(:)", rf"\1-sid-{sid}\2", proxy_url, count=1)
 
 
 def generate_filename(url: str, chunk_number: int, chunk_size: int) -> str:
@@ -28,7 +41,9 @@ def download_and_chunk_video(
     url: str, config: ScrapingConfig
 ) -> typing.Tuple[int, int]:
     print(f"Processing {url}")
-    duration = get_video_duration(url)
+    # Use one sticky session per video so the IP doesn't rotate mid-download
+    session_proxy = sticky_proxy(config.proxy_url)
+    duration = get_video_duration(url, session_proxy)
     if duration == 0:
         print(f"Skipping {url} due to error in fetching duration")
         return 0, 0
@@ -38,7 +53,12 @@ def download_and_chunk_video(
     ydl_opts = {
         "format": config.format,
         "outtmpl": temp_filename,
+        "socket_timeout": 120,
+        "retries": 5,
+        "fragment_retries": 5,
     }
+    if session_proxy:
+        ydl_opts["proxy"] = session_proxy
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
@@ -109,9 +129,11 @@ def download_and_chunk_video(
     return chunks_downloaded, actual_duration
 
 
-def get_video_duration(url: str) -> int:
+def get_video_duration(url: str, proxy_url: str = "") -> int:
     print(f"Fetching duration for {url}")
-    ydl_opts = {"quiet": True}
+    ydl_opts = {"quiet": True, "socket_timeout": 60}
+    if proxy_url:
+        ydl_opts["proxy"] = proxy_url
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
