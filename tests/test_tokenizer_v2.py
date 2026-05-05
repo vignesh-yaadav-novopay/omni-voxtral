@@ -70,6 +70,18 @@ def test_iso3_to_whisper_returns_iso1_for_supported():
     assert iso3_to_whisper_code("eng") == "en"
 
 
+def test_normalize_language_aliases():
+    """LID models in the wild emit alias codes that aren't strict ISO 639-3 —
+    accept and canonicalize them rather than failing the entire chunk."""
+    # MMS LID emits "npi" for Western Nepali → use "nep" macrolanguage
+    assert normalize_language_to_iso3("npi") == "nep"
+    # Whisper LID returns "ory" (B-form) for Odia → "ori" (T-form we use)
+    assert normalize_language_to_iso3("ory") == "ori"
+    # Other MMS rare aliases observed in the YT LID pass
+    assert normalize_language_to_iso3("sin") == "snd"
+    assert normalize_language_to_iso3("bod") == "brx"
+
+
 # ---------------------------------------------------------------------------
 # Config defaults — Phase 1 spec
 # ---------------------------------------------------------------------------

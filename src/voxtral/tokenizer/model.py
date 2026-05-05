@@ -49,15 +49,30 @@ _ALL_ISO3 = set(_ISO1_TO_ISO3.values()) | _ISO3_ONLY
 _ISO3_TO_ISO1 = {v: k for k, v in _ISO1_TO_ISO3.items()}
 
 
-def normalize_language_to_iso3(lang: str) -> str:
-    """Normalize ISO 639-1 (or already-639-3) to ISO 639-3 for SP control tokens.
+# Aliases the wild produces that aren't strict ISO 639-3:
+# - MMS LID emits "npi" (Western Nepali, ISO 639-3) → map to "nep" (macrolanguage we use)
+# - Whisper LID emits "ory" for Odia (ISO 639-2/T) → map to "ori" (ISO 639-2/B form we use)
+# - "sin" sometimes seen for Sindhi → map to "snd"
+# - Two-letter "or" / "ne" (ISO 639-1) handled by _ISO1_TO_ISO3 above.
+_LANG_ALIASES = {
+    "npi": "nep",   # Nepali (Western) → Nepali macrolanguage
+    "ory": "ori",   # Odia (B-form code variant)
+    "sin": "snd",   # Sindhi sometimes seen
+    "bod": "brx",   # Bodo (rare alias)
+}
 
-    Idempotent for already-639-3 inputs. Raises on unknown languages.
+
+def normalize_language_to_iso3(lang: str) -> str:
+    """Normalize ISO 639-1 / ISO 639-3 / known aliases to our canonical 639-3.
+
+    Idempotent for already-canonical inputs. Raises on unknown languages.
     """
     if not lang:
         raise ValueError("normalize_language_to_iso3: empty language")
     if lang in _ISO1_TO_ISO3:
         return _ISO1_TO_ISO3[lang]
+    if lang in _LANG_ALIASES:
+        return _LANG_ALIASES[lang]
     if lang in _ALL_ISO3:
         return lang
     raise ValueError(
