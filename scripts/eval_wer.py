@@ -61,22 +61,46 @@ def _load_fleurs_samples(lang: str, n: int) -> list[dict]:
 
 
 def _generate_audio_from_checkpoint(
-    ckpt_path: str,
+    pipeline,
     prompts: list[dict],
     language: str,
-    device: str,
+    *,
+    max_windows: int = 150,
+    temperature: float = 0.8,
+    top_k: int | None = 250,
+    prompt_tokens: int = 100,
 ) -> list[torch.Tensor]:
-    """Load the checkpoint and generate continuation audio for each prompt.
+    """Generate continuation audio for each prompt using a loaded pipeline.
 
-    Reuses scripts/generate.py code path for inference.
+    `pipeline` comes from `scripts.generate.load_inference_pipeline()` and is
+    reused across all FLEURS samples in this language to avoid reloading the
+    model 5×N times.
+    `language` is the ISO 639-3 tag (e.g. "hin", "tam") used as the SP control
+    token at the start of each generation.
     """
-    log.info(f"[eval_wer:{language}] generating {len(prompts)} samples (ckpt={ckpt_path})")
-    # The actual generate path is in scripts/generate.py; we shell out for now.
-    # In a full integration, refactor generate.py into a module and call directly.
-    raise NotImplementedError(
-        "Wire scripts/generate.py into a module-level function and call from here. "
-        "Until then, run scripts/generate.py manually per prompt."
-    )
+    from scripts.generate import generate_audio
+
+    log.info(f"[eval_wer:{language}] generating {len(prompts)} samples")
+    out = []
+    for i, sample in enumerate(prompts):
+        try:
+            audio_arr = sample["audio"]["array"]
+            sr = int(sample["audio"]["sampling_rate"])
+            wav = generate_audio(
+                pipeline,
+                prompt_audio=audio_arr,
+                prompt_sample_rate=sr,
+                prompt_tokens=prompt_tokens,
+                language=language,
+                max_windows=max_windows,
+                temperature=temperature,
+                top_k=top_k,
+            )
+            out.append(wav)
+        except Exception as e:
+            log.warning(f"[eval_wer:{language}] sample {i} generation failed: {e}")
+            out.append(None)
+    return out
 
 
 def run_wer_evaluation(
@@ -94,6 +118,7 @@ def run_wer_evaluation(
     """
     import jiwer
     from faster_whisper import WhisperModel
+    from scripts.generate import load_inference_pipeline
 
     if output_path is None:
         run_id = Path(ckpt_path).stem
@@ -104,6 +129,7 @@ def run_wer_evaluation(
         device="cuda" if device.startswith("cuda") else "cpu",
         compute_type="float16" if device.startswith("cuda") else "int8",
     )
+    pipeline = load_inference_pipeline(ckpt_path, device=device)
 
     per_lang: dict[str, dict] = {}
     failed_langs: list[str] = []
@@ -112,21 +138,10 @@ def run_wer_evaluation(
         if not samples:
             log.warning(f"[{lang}] no FLEURS samples available; skipping")
             continue
-        # Step 1: prompt the model with each sample's audio, generate continuation.
-        # The generation step is environment-dependent (depends on loaded
-        # checkpoint). We provide the harness; users wire it via generate.py.
-        try:
-            generated_audio = _generate_audio_from_checkpoint(
-                ckpt_path, samples, lang, device,
-            )
-        except NotImplementedError:
-            log.warning(
-                f"[{lang}] generation harness not yet wired — drop generated wavs "
-                f"under logs/eval/{Path(ckpt_path).stem}/{lang}/*.wav and rerun."
-            )
-            # Fallback: just transcribe the FLEURS reference audio so WER still
-            # has a defined value (≈0 — model = reference). Useful smoke for the harness.
-            generated_audio = [None] * len(samples)
+        lang_iso3 = ISO1_TO_ISO3.get(lang, lang)
+        generated_audio = _generate_audio_from_checkpoint(
+            pipeline, samples, lang_iso3,
+        )
 
         wer_values = []
         for i, sample in enumerate(samples):

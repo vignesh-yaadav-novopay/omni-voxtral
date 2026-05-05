@@ -4,18 +4,24 @@ Takes a trained checkpoint (or untrained model) and generates audio
 via autoregressive temporal + depth decoding, then Mimi decode to wav.
 
 Usage:
-    # Generate from a checkpoint:
+    # CLI:
     CUDA_VISIBLE_DEVICES=0 uv run scripts/generate.py --ckpt_path checkpoints/step_2000.pt
-
-    # Generate from scratch (random init, for pipeline validation):
     CUDA_VISIBLE_DEVICES=0 uv run scripts/generate.py --max_windows 20
-
-    # Generate with a real data prompt (first N tokens from a .npy file):
     CUDA_VISIBLE_DEVICES=0 uv run scripts/generate.py --prompt_file data/tokens_fleurs/hi/hi/hi_000000_*.npy --prompt_tokens 100
+
+    # Module (used by tests/eval_wer.py):
+    from scripts.generate import load_inference_pipeline, generate_audio
+    pipeline = load_inference_pipeline("ckpt.pt", device="cuda:0")
+    waveform = generate_audio(pipeline, prompt_audio=fleurs_array, language="hin",
+                              prompt_sample_rate=16000, max_windows=150)
 """
+
+from __future__ import annotations
 
 import argparse
 import time
+from dataclasses import dataclass
+from typing import Optional
 
 import dotenv
 import numpy as np
@@ -27,6 +33,17 @@ from voxtral.tokenizer.model import VoxtralTokenizer, VoxtralTokenizerConfig
 from voxtral.trainer.config import VoxtralTrainConfig
 
 dotenv.load_dotenv()
+
+
+@dataclass
+class InferencePipeline:
+    """Bundle of objects needed for inference. Instantiate via
+    `load_inference_pipeline()`. Reused across multiple generations of the same
+    checkpoint to amortize the model+Mimi load cost."""
+    model: OmniVoxtral
+    tokenizer: VoxtralTokenizer
+    config: VoxtralTrainConfig
+    device: torch.device
 
 
 def build_model(config: VoxtralTrainConfig, device: torch.device) -> OmniVoxtral:
@@ -202,6 +219,117 @@ def tokens_to_audio(
     return audio.squeeze(0)
 
 
+def load_inference_pipeline(
+    ckpt_path: Optional[str],
+    config: Optional[VoxtralTrainConfig] = None,
+    device: str | torch.device = "cuda:0",
+) -> InferencePipeline:
+    """Load model + Mimi tokenizer ready for inference.
+
+    Designed to be called once per checkpoint and reused across many calls to
+    `generate_audio()` (model load is the expensive part). Both `eval_wer.py`
+    and the no-gibberish/interruption integration tests import this.
+    """
+    if config is None:
+        config = VoxtralTrainConfig()
+    dev = torch.device(device if torch.cuda.is_available() or "cpu" in str(device) else "cpu")
+
+    model = build_model(config, dev)
+    if ckpt_path:
+        load_checkpoint(model, ckpt_path, dev)
+
+    tok_cfg = config.voxtral_tokenizer_config
+    tokenizer = VoxtralTokenizer(tok_cfg).to(device=dev, dtype=torch.float16)
+
+    return InferencePipeline(model=model, tokenizer=tokenizer, config=config, device=dev)
+
+
+def encode_prompt_audio(
+    audio: np.ndarray | torch.Tensor,
+    sample_rate: int,
+    tokenizer: VoxtralTokenizer,
+    language: str,
+    n_tokens: Optional[int] = None,
+) -> torch.Tensor:
+    """Tokenize a raw waveform into a 1-D prompt tensor for `generate_audio`.
+
+    `language` is REQUIRED (Phase 1 contract — no silent English fallback).
+    If `n_tokens` is set, truncates to the first N tokens (useful for short
+    "prompt with first 2 seconds" pattern in WER eval).
+    """
+    if isinstance(audio, np.ndarray):
+        audio = torch.from_numpy(audio.astype(np.float32))
+    if audio.dim() == 1:
+        audio = audio.unsqueeze(0)
+    if audio.dim() == 2 and audio.size(0) > 1:
+        audio = audio.mean(dim=0, keepdim=True)
+    audio = audio.unsqueeze(0)  # (1, 1, T)
+
+    target_sr = 24_000
+    if sample_rate != target_sr:
+        audio = torchaudio.functional.resample(audio, sample_rate, target_sr)
+
+    device = next(tokenizer.parameters()).device
+    audio = audio.to(device=device, dtype=torch.float16)
+
+    tokens, _meta = tokenizer.encode(audio, target_sr, language=language)
+    tokens = tokens.squeeze(0)
+    if n_tokens is not None and tokens.numel() > n_tokens:
+        tokens = tokens[:n_tokens]
+    return tokens
+
+
+def generate_audio(
+    pipeline: InferencePipeline,
+    *,
+    prompt: Optional[torch.Tensor] = None,
+    prompt_audio: Optional[np.ndarray | torch.Tensor] = None,
+    prompt_sample_rate: int = 24_000,
+    prompt_tokens: int = 100,
+    language: str = "eng",
+    max_windows: int = 150,
+    temperature: float = 0.8,
+    top_k: Optional[int] = 250,
+    repetition_penalty: float = 1.2,
+    return_tokens: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Generate audio with one call. Entrypoint used by tests + eval_wer.
+
+    Exactly one of `prompt` / `prompt_audio` may be supplied (or neither, for
+    unconditional generation from a random text token). Returns a 1-D float32
+    waveform on CPU at 24 kHz; with `return_tokens=True`, returns
+    `(waveform, full_token_sequence)` so the interruption-emission test can
+    inspect the model-stream text tokens directly.
+    """
+    if prompt is not None and prompt_audio is not None:
+        raise ValueError("pass at most one of prompt / prompt_audio")
+
+    if prompt_audio is not None:
+        prompt = encode_prompt_audio(
+            prompt_audio, prompt_sample_rate, pipeline.tokenizer,
+            language=language, n_tokens=prompt_tokens,
+        )
+
+    tokens = generate_tokens(
+        model=pipeline.model,
+        prompt=prompt,
+        max_windows=max_windows,
+        temperature=temperature,
+        top_k=top_k,
+        device=pipeline.device,
+        repetition_penalty=repetition_penalty,
+    )
+
+    waveform = tokens_to_audio(tokens, pipeline.tokenizer)
+    waveform = waveform.detach().cpu().float()
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+
+    if return_tokens:
+        return waveform, tokens.detach().cpu()
+    return waveform
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate audio from OmniVoxtral")
     parser.add_argument("--ckpt_path", type=str, default=None)
@@ -212,34 +340,23 @@ def main():
     parser.add_argument("--top_k", type=int, default=250, help="Top-k filtering for sampling (250=good default, None=no filter)")
     parser.add_argument("--output", type=str, default="generated.wav")
     parser.add_argument("--repetition_penalty", type=float, default=1.2, help="Repetition penalty for text tokens (1.0=off, 1.2=default)")
+    parser.add_argument("--language", type=str, default="eng", help="ISO 639-3 language tag for the SP control token")
     parser.add_argument("--device", type=str, default="cuda:0")
     args = parser.parse_args()
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     config = VoxtralTrainConfig()
 
     print("=== OmniVoxtral Generation ===")
     print(f"  Model: {config.mistral_pretrained_path}")
     print(f"  Depth: {config.depth_num_layers}L")
     print(f"  Checkpoint: {args.ckpt_path or 'random init'}")
+    print(f"  Language: {args.language}")
     print(f"  Windows: {args.max_windows} (~{args.max_windows / 5:.1f}s audio at 5Hz)")
     print(f"  Temperature: {args.temperature}")
     print()
 
-    # Build model
-    print("Loading model...")
-    model = build_model(config, device)
-    if args.ckpt_path:
-        load_checkpoint(model, args.ckpt_path, device)
+    pipeline = load_inference_pipeline(args.ckpt_path, config=config, device=args.device)
 
-    # EMBNORM-1: DISABLED — rescaling embeddings at inference breaks the model.
-    # The model was trained with original embedding norms. Changing them at
-    # inference produces inputs the model has never seen, causing immediate
-    # degradation after the prompt tokens run out.
-    # If embedding norm mismatch is a problem, fix it in training (init_embeddings.py),
-    # not at inference.
-
-    # Load prompt if provided
     prompt = None
     if args.prompt_file:
         prompt_data = np.load(args.prompt_file)
@@ -248,36 +365,19 @@ def main():
             prompt = prompt[:args.prompt_tokens]
         print(f"Prompt: {len(prompt)} tokens from {args.prompt_file}")
 
-    # Generate tokens
-    tokens = generate_tokens(
-        model=model,
+    waveform = generate_audio(
+        pipeline,
         prompt=prompt,
+        language=args.language,
         max_windows=args.max_windows,
         temperature=args.temperature,
         top_k=args.top_k,
-        device=device,
         repetition_penalty=args.repetition_penalty,
     )
+    print(f"  Audio shape: {waveform.shape}")
+    print(f"  Duration: {waveform.shape[-1] / 24000:.2f}s at 24kHz")
 
-    print(f"\nGenerated token sequence: {tokens.shape}")
-    print(f"  Range: [{tokens.min().item()}, {tokens.max().item()}]")
-
-    # Decode to audio
-    print("Loading Mimi tokenizer for audio decoding...")
-    tok_config = config.voxtral_tokenizer_config
-    tokenizer = VoxtralTokenizer(tok_config)
-    tokenizer = tokenizer.to(device=device, dtype=torch.float16)
-
-    print("Decoding tokens to audio...")
-    audio = tokens_to_audio(tokens, tokenizer)
-    print(f"  Audio shape: {audio.shape}")
-    print(f"  Duration: {audio.shape[-1] / 24000:.2f}s at 24kHz")
-
-    # Save wav
-    audio_cpu = audio.cpu().float()
-    if audio_cpu.dim() == 1:
-        audio_cpu = audio_cpu.unsqueeze(0)
-    torchaudio.save(args.output, audio_cpu, 24000)
+    torchaudio.save(args.output, waveform, 24000)
     print(f"\nSaved: {args.output}")
     print("=== Done ===")
 
