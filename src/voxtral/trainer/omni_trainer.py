@@ -128,11 +128,17 @@ def compute_omni_loss(
     model: OmniVoxtral | DistributedDataParallel,
     x: torch.Tensor,
     config: VoxtralTrainConfig,
+    valid_token_mask: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute combined temporal + depth loss.
 
     Handles both single-stream and dual-stream token layouts.
     Returns dict with 'temporal_loss', 'depth_loss', and 'total_loss'.
+
+    Phase 1.5: `valid_token_mask` (batch, seq_len) bool. False positions are
+    zero-padded silence — their loss contribution is zeroed before reduction so
+    the model never sees the silent-loop signal Defect 4 produced. None means
+    treat all positions as valid (back-compat with legacy data).
     """
     omni = utils.unwrap_model(model)
 
@@ -189,7 +195,23 @@ def compute_omni_loss(
         reduction="none",
     )
     batch_size = target_ids.size(0)
-    temporal_loss = (temporal_per_token * weights.repeat(batch_size)).mean()
+    weighted = temporal_per_token * weights.repeat(batch_size)
+    if valid_token_mask is not None:
+        # Align mask with target_ids (drop the first position to match the shift).
+        # If the user provided a mask shorter than seq_len (legacy path), pad with True.
+        token_mask_full = valid_token_mask.to(weighted.device, dtype=torch.bool)
+        if token_mask_full.size(1) < x.size(1):
+            pad = torch.ones(
+                token_mask_full.size(0), x.size(1) - token_mask_full.size(1),
+                dtype=torch.bool, device=weighted.device,
+            )
+            token_mask_full = torch.cat([token_mask_full, pad], dim=1)
+        token_mask = token_mask_full[:, 1:].reshape(-1).float()
+        denom = token_mask.sum().clamp_min(1.0)
+        temporal_loss = (weighted * token_mask).sum() / denom
+    else:
+        token_mask_full = None
+        temporal_loss = weighted.mean()
 
     # --- Depth Loss (cross-entropy over codebook predictions) ---
     depth_logits = outputs["depth_logits"]
@@ -201,6 +223,14 @@ def compute_omni_loss(
     label_smoothing = config.depth_label_smoothing
     per_q_losses = []
     focal_gamma = config.depth_focal_gamma
+
+    # Phase 1.5 frame mask: each frame's q0 lives at `frame_positions[f]` in the
+    # full sequence. Masking q0 → mask the whole frame.
+    frame_mask: torch.Tensor | None = None
+    if token_mask_full is not None:
+        # frame_positions: (num_frames,), token_mask_full: (batch, seq_len)
+        frame_mask = token_mask_full[:, frame_positions].float()  # (batch, num_frames)
+
     for q in range(num_q):
         if focal_gamma > 0:
             ce = F.cross_entropy(
@@ -210,13 +240,28 @@ def compute_omni_loss(
                 reduction="none",
             )
             pt = torch.exp(-ce)
-            q_loss = ((1 - pt) ** focal_gamma * ce).mean()
+            ce_focal = (1 - pt) ** focal_gamma * ce
+            if frame_mask is not None:
+                m = frame_mask.reshape(-1)
+                q_loss = (ce_focal * m).sum() / m.sum().clamp_min(1.0)
+            else:
+                q_loss = ce_focal.mean()
         else:
-            q_loss = F.cross_entropy(
-                depth_logits[:, :, q].reshape(-1, codebook_size).float(),
-                cb_targets_local[:, :, q].reshape(-1),
-                label_smoothing=label_smoothing,
-            )
+            if frame_mask is not None:
+                ce = F.cross_entropy(
+                    depth_logits[:, :, q].reshape(-1, codebook_size).float(),
+                    cb_targets_local[:, :, q].reshape(-1),
+                    label_smoothing=label_smoothing,
+                    reduction="none",
+                )
+                m = frame_mask.reshape(-1)
+                q_loss = (ce * m).sum() / m.sum().clamp_min(1.0)
+            else:
+                q_loss = F.cross_entropy(
+                    depth_logits[:, :, q].reshape(-1, codebook_size).float(),
+                    cb_targets_local[:, :, q].reshape(-1),
+                    label_smoothing=label_smoothing,
+                )
         per_q_losses.append(q_loss)
     per_q_losses = torch.stack(per_q_losses)
     if config.depth_q_weights is not None:
@@ -282,9 +327,12 @@ def omni_train_step(
     """
     device = utils.get_device()
     x = batch["tokens"].to(device)
+    valid_mask = batch.get("valid_token_mask")
+    if isinstance(valid_mask, torch.Tensor):
+        valid_mask = valid_mask.to(device)
     accum_steps = config.gradient_accumulation_steps
 
-    losses = compute_omni_loss(state.model, x=x, config=config)
+    losses = compute_omni_loss(state.model, x=x, config=config, valid_token_mask=valid_mask)
 
     # Scale loss by accumulation steps so gradients average correctly
     scaled_loss = losses["total_loss"] / accum_steps
@@ -314,3 +362,34 @@ def omni_train_step(
     stats["depth_q1_7_acc"] += losses["depth_q1_7_acc"].item()
 
     return state, stats
+
+
+def aggregate_val_metrics_across_ranks(
+    local_metrics: dict[str, float],
+) -> dict[str, float]:
+    """Audit AF-406: report MEAN across DDP ranks (and std), not best-rank.
+
+    On a single-rank run, returns local_metrics with per-key `_std=0.0`.
+    On a DDP run, all-reduces sum and sum-of-squares to compute mean/std.
+
+    Use this in the training loop's val pass: replace per-rank reporting with
+    `aggregate_val_metrics_across_ranks(local)` before logging to W&B.
+    """
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return {**local_metrics, **{f"{k}_std": 0.0 for k in local_metrics}}
+    world_size = torch.distributed.get_world_size()
+    keys = sorted(local_metrics.keys())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vals = torch.tensor([local_metrics[k] for k in keys], device=device, dtype=torch.float64)
+    sq = vals * vals
+    torch.distributed.all_reduce(vals, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(sq, op=torch.distributed.ReduceOp.SUM)
+    mean = vals / world_size
+    var = (sq / world_size) - mean * mean
+    var = var.clamp_min(0.0)
+    std = var.sqrt()
+    out: dict[str, float] = {}
+    for i, k in enumerate(keys):
+        out[k] = float(mean[i].item())
+        out[f"{k}_std"] = float(std[i].item())
+    return out
