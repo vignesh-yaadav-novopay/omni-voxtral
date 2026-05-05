@@ -22,7 +22,52 @@ from voxtral.data.sidecar import (
     read_metadata_sidecar,
     write_metadata_sidecar,
 )
-from voxtral.tokenizer.model import VoxtralTokenizerConfig, _DEFAULT_SP_MODEL
+from voxtral.tokenizer.model import (
+    VoxtralTokenizerConfig,
+    _DEFAULT_SP_MODEL,
+    iso3_to_whisper_code,
+    normalize_language_to_iso3,
+)
+
+
+# ---------------------------------------------------------------------------
+# ISO 639-1 ↔ ISO 639-3 — added in Phase 1 fix
+# ---------------------------------------------------------------------------
+
+def test_normalize_language_iso1_to_iso3():
+    assert normalize_language_to_iso3("hi") == "hin"
+    assert normalize_language_to_iso3("ta") == "tam"
+    assert normalize_language_to_iso3("bn") == "ben"
+    assert normalize_language_to_iso3("en") == "eng"
+
+
+def test_normalize_language_idempotent_for_iso3():
+    """Already-639-3 inputs should stay unchanged — caller didn't have to know."""
+    assert normalize_language_to_iso3("hin") == "hin"
+    assert normalize_language_to_iso3("brx") == "brx"
+    assert normalize_language_to_iso3("eng") == "eng"
+
+
+def test_normalize_language_rejects_unknown():
+    """An unknown code must raise rather than silently mapping to <unk>."""
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        normalize_language_to_iso3("xx")
+    with _pytest.raises(ValueError):
+        normalize_language_to_iso3("unknown")
+
+
+def test_iso3_to_whisper_returns_none_for_mms_only_langs():
+    """The 7 Indic languages routed via MMS — Whisper has no support."""
+    for mms in ["brx", "doi", "kok", "mni", "sat", "snd", "kas"]:
+        assert iso3_to_whisper_code(mms) is None, f"{mms} should not map to Whisper"
+
+
+def test_iso3_to_whisper_returns_iso1_for_supported():
+    assert iso3_to_whisper_code("hin") == "hi"
+    assert iso3_to_whisper_code("tam") == "ta"
+    assert iso3_to_whisper_code("ben") == "bn"
+    assert iso3_to_whisper_code("eng") == "en"
 
 
 # ---------------------------------------------------------------------------

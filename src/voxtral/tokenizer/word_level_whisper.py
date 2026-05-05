@@ -80,7 +80,7 @@ def tokens_to_words(
 
     for batch_idx in range(generate_outputs["sequences"].shape[0]):
         predicted_ids = generate_outputs["sequences"][batch_idx].cpu().numpy()
-        token_timestamps = generate_outputs["token_timestamps"][batch_idx].numpy()
+        token_timestamps = generate_outputs["token_timestamps"][batch_idx].cpu().numpy()
 
         text_tokens = [token for token in predicted_ids]
         if language in {"zh", "ja", "th", "lo", "my"}:
@@ -175,8 +175,11 @@ def generate_tokens(
     is removed; both kwargs are always forwarded.
     """
     device = next(model.parameters()).device
+    # Whisper's HF processor wants a numpy array on the CPU. The encode path
+    # often passes a CUDA fp16 tensor, so move to CPU + float32 first.
+    audio_cpu = audio.detach().to(device="cpu", dtype=torch.float32).numpy()
     input_features = processor(
-        audio.numpy(), sampling_rate=16000, return_tensors="pt"
+        audio_cpu, sampling_rate=16000, return_tensors="pt"
     ).input_features.to(device, audio.dtype)
     return model.generate(
         input_features,
@@ -231,15 +234,41 @@ class TimedWhisperTokenizer(torch.nn.Module):
             )
         return effective
 
-    def _tokenize_bucket(self, texts: list[str], device: torch.device) -> torch.Tensor:
-        """Tokenize a list of bucket texts, padding/truncating to self.hertz tokens each."""
+    def _lang_token_id(self, language_iso3: str) -> int | None:
+        """Look up the SP id for `<|lang:<iso3>|>`. Returns None if SP isn't
+        loaded or the control token isn't in the vocab (shouldn't happen for
+        the trained vocab, but guard so smoke tests don't crash on a fresh SP)."""
+        if self.sp_tokenizer is None:
+            return None
+        piece = f"<|lang:{language_iso3}|>"
+        tok_id = self.sp_tokenizer.PieceToId(piece)
+        # SP returns the unk_id (1) for unknown pieces.
+        if tok_id == self.sp_tokenizer.unk_id():
+            return None
+        return tok_id
+
+    def _tokenize_bucket(
+        self,
+        texts: list[str],
+        device: torch.device,
+        lang_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """Tokenize per-bucket transcripts.
+
+        If `lang_token_id` is given, prepend it to the FIRST bucket only (per
+        the per_utterance language-tag mode locked in Phase 0 — the model sees
+        the language control token once at the start of each utterance, then
+        the source-language inner monologue for the rest).
+        """
         if self.sp_tokenizer is not None:
             pad_id = self.sp_tokenizer.pad_id()
             if pad_id < 0:
                 pad_id = 0
             all_ids = []
-            for text in texts:
+            for i, text in enumerate(texts):
                 ids = self.sp_tokenizer.Encode(text)
+                if i == 0 and lang_token_id is not None:
+                    ids = [lang_token_id] + ids
                 ids = ids[: self.hertz]
                 ids = ids + [pad_id] * (self.hertz - len(ids))
                 all_ids.append(ids)
@@ -278,12 +307,18 @@ class TimedWhisperTokenizer(torch.nn.Module):
         sample_rate: int,
         language: str | None = None,
         task: str = "transcribe",
+        sp_lang_iso3: str | None = None,
     ) -> tuple[torch.Tensor, dict[str, typing.Any]]:
         """Bucketed tokens + raw transcript metadata, in a single Whisper pass.
 
+        `language` is the Whisper-facing code (ISO 639-1, e.g. "hi"). If the
+        caller is using the SP tokenizer with language control tokens, also
+        pass `sp_lang_iso3` (e.g. "hin") so the first bucket gets the
+        `<|lang:<iso3>|>` control token prepended (per_utterance mode).
+
         Returns:
             tokens: (batch, num_buckets * hertz)
-            meta: per-batch list of dicts {transcript, avg_logprob, num_words}
+            meta: per-batch dict list {transcript, avg_logprob, num_words}
         """
         assert sample_rate == 16000, "Sample rate must be 16000"
         assert audio.ndim == 2, "Audio must be 2D, batch x time"
@@ -297,6 +332,8 @@ class TimedWhisperTokenizer(torch.nn.Module):
         alignment = tokens_to_words(outputs, self.tokenizer, effective_lang)
         [merge_punctuations(a) for a in alignment]
 
+        lang_token_id = self._lang_token_id(sp_lang_iso3) if sp_lang_iso3 else None
+
         # Build bucketed token tensor + per-batch transcripts
         per_batch_meta: list[dict[str, typing.Any]] = []
         buckets_per_item: list[torch.Tensor] = []
@@ -305,7 +342,7 @@ class TimedWhisperTokenizer(torch.nn.Module):
                 a, bucket_size=1.0, total_duration=total_duration
             )
             out = [clean_text(" ".join(b)) for b in out]
-            bucket_tokens = self._tokenize_bucket(out, device)
+            bucket_tokens = self._tokenize_bucket(out, device, lang_token_id=lang_token_id)
             buckets_per_item.append(bucket_tokens)
 
             transcript = self.tokenizer.decode(

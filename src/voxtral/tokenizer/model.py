@@ -29,6 +29,53 @@ dotenv.load_dotenv()
 _DEFAULT_SP_MODEL = "data/tokenizer/omnivoxtral_sp.model"
 
 
+# ISO 639-1 → ISO 639-3. ONLY languages that have real ISO 639-1 codes go
+# in this map. The 7 MMS-routed Indic languages (brx, doi, kok, mni, sat,
+# snd, kas) and a few others without 639-1 codes are listed separately in
+# `_ISO3_ONLY` below. The split matters: iso3_to_whisper_code() must return
+# None for MMS-only langs so the encode path knows to route them through MMS
+# instead of crashing in Whisper.
+_ISO1_TO_ISO3 = {
+    "as": "asm", "bn": "ben", "en": "eng", "gu": "guj", "hi": "hin",
+    "kn": "kan", "ml": "mal", "mr": "mar", "ne": "nep", "or": "ori",
+    "pa": "pan", "ta": "tam", "te": "tel", "ur": "urd",
+}
+_ISO3_ONLY = {
+    "brx", "doi", "kas", "kok", "mai", "mni", "san", "sat", "snd",
+}
+_ALL_ISO3 = set(_ISO1_TO_ISO3.values()) | _ISO3_ONLY
+
+
+_ISO3_TO_ISO1 = {v: k for k, v in _ISO1_TO_ISO3.items()}
+
+
+def normalize_language_to_iso3(lang: str) -> str:
+    """Normalize ISO 639-1 (or already-639-3) to ISO 639-3 for SP control tokens.
+
+    Idempotent for already-639-3 inputs. Raises on unknown languages.
+    """
+    if not lang:
+        raise ValueError("normalize_language_to_iso3: empty language")
+    if lang in _ISO1_TO_ISO3:
+        return _ISO1_TO_ISO3[lang]
+    if lang in _ALL_ISO3:
+        return lang
+    raise ValueError(
+        f"Unknown language code {lang!r}; expected ISO 639-1 (e.g. 'hi') or "
+        f"ISO 639-3 (e.g. 'hin'). Known: {sorted(_ALL_ISO3)}."
+    )
+
+
+def iso3_to_whisper_code(lang_iso3: str) -> str | None:
+    """Map ISO 639-3 to the ISO 639-1 form Whisper accepts.
+
+    Returns None for the 7 MMS-only Indic languages (brx, doi, kok, mni, sat,
+    snd, kas) plus a few others without Whisper coverage (mai, san). The
+    encode path must check for None and route those calls through MMS.
+    """
+    return _ISO3_TO_ISO1.get(lang_iso3)
+
+
 class VoxtralTokenizerConfig(typing.NamedTuple):
     mimi_path: str = "kyutai/mimi"
     whisper_path: str = "openai/whisper-large-v3"
@@ -93,13 +140,19 @@ class VoxtralTokenizer(torch.nn.Module):
         return next(self.mimi.parameters()).device
 
     def _resolve_language(self, language: str | None) -> str:
+        """Resolve + normalize the language to ISO 639-3.
+
+        The SP vocab uses 639-3 (e.g. <|lang:hin|>), but callers commonly pass
+        639-1 from dataset metadata (e.g. FLEURS_LANGS keys are "hi", "ta").
+        Normalize once here so downstream code doesn't have to.
+        """
         effective = language if language is not None else self.config.language
         if effective is None:
             raise ValueError(
                 "VoxtralTokenizer: `language` must be passed at config or per-call. "
                 "Defect 1 fix: no silent fallback to 'en'."
             )
-        return effective
+        return normalize_language_to_iso3(effective)
 
     def _build_metadata(
         self,
@@ -117,6 +170,9 @@ class VoxtralTokenizer(torch.nn.Module):
         meta: dict[str, typing.Any] = {
             "schema_version": 2,
             "preprocessing_version": "v2.0",
+            # `language` is always written in ISO 639-3 (e.g. "hin") so the
+            # trainer's language-temperature sampler / val-split builder don't
+            # have to mix conventions.
             "language": language,
             "language_method": "caller_provided",
             "language_confidence": 1.0,
@@ -141,7 +197,7 @@ class VoxtralTokenizer(torch.nn.Module):
                 "stride": self.stream_stride,
             },
             "token_count": int(tokens.size(-1)),
-            "token_range": [int(tokens.min()), int(tokens.max())],
+            "token_range": [int(tokens.min().item()), int(tokens.max().item())],
             "valid_token_mask": None,  # Phase 1.5 fills this in via writer helper
         }
         if source_metadata:
@@ -180,8 +236,18 @@ class VoxtralTokenizer(torch.nn.Module):
         effective_lang = self._resolve_language(language)
 
         x_for_whisper = ta.functional.resample(x, sample_rate, 16_000)[:, 0]
+        # effective_lang is ISO 639-3; Whisper wants ISO 639-1.
+        whisper_lang = iso3_to_whisper_code(effective_lang)
+        if whisper_lang is None:
+            raise ValueError(
+                f"Whisper does not support language {effective_lang!r}. The 7 "
+                "Indic languages without Whisper coverage (brx, doi, kok, mni, "
+                "sat, snd, kas) must route through MMS — see scripts/detect_language.py"
+            )
         text_tokens, whisper_meta = self.whisper.forward_with_transcript(
-            x_for_whisper, sample_rate=16_000, language=effective_lang, task=task
+            x_for_whisper, sample_rate=16_000,
+            language=whisper_lang, task=task,
+            sp_lang_iso3=effective_lang,
         )
 
         # make sure every quantizer uses different tokens
@@ -238,10 +304,15 @@ class VoxtralTokenizer(torch.nn.Module):
         """
         assert x.dim() == 3 and x.size(1) == 1
         assert sample_rate == 24_000
-        effective_lang = self._resolve_language(language)
+        effective_lang = self._resolve_language(language)  # ISO 639-3
+        whisper_lang = iso3_to_whisper_code(effective_lang)
+        if whisper_lang is None:
+            raise ValueError(
+                f"Whisper translate doesn't support {effective_lang!r}; route MMS langs separately."
+            )
         x_for_whisper = ta.functional.resample(x, sample_rate, 16_000)[:, 0]
         return self.whisper.translate(
-            x_for_whisper, sample_rate=16_000, language=effective_lang
+            x_for_whisper, sample_rate=16_000, language=whisper_lang
         )
 
     @torch.no_grad()

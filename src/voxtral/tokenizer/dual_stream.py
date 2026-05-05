@@ -109,11 +109,22 @@ class DualStreamTokenizer(torch.nn.Module):
     ) -> torch.Tensor:
         """Encode raw audio to text tokens via Whisper.
 
-        v2: per-call `language` and `task` plumbed through. Required if the parent
-        config didn't lock a default at __init__.
+        v2: per-call `language` and `task` plumbed through. `language` is the
+        Whisper ISO 639-1 code (e.g. "hi"); the SP control token is injected
+        from the corresponding ISO 639-3 form via `forward_with_transcript`.
         """
+        from .model import iso3_to_whisper_code, normalize_language_to_iso3
         x_16k = ta.functional.resample(audio, sample_rate, 16_000)[:, 0]
-        return self.whisper(x_16k, sample_rate=16_000, language=language, task=task)
+        # Allow callers to pass either ISO 639-1 or 639-3 — normalize once,
+        # then route the right form to Whisper vs SP.
+        sp_iso3 = normalize_language_to_iso3(language) if language else None
+        whisper_iso1 = iso3_to_whisper_code(sp_iso3) if sp_iso3 else None
+        tokens, _ = self.whisper.forward_with_transcript(
+            x_16k, sample_rate=16_000,
+            language=whisper_iso1, task=task,
+            sp_lang_iso3=sp_iso3,
+        )
+        return tokens
 
     @torch.no_grad()
     def encode(
@@ -297,7 +308,7 @@ class DualStreamTokenizer(torch.nn.Module):
                 "stride": self.dual_stride,
             },
             "token_count": int(tokens.size(-1)),
-            "token_range": [int(tokens.min()), int(tokens.max())],
+            "token_range": [int(tokens.min().item()), int(tokens.max().item())],
             "valid_token_mask": None,
             "user_translation_en": user_translation_en,
             "model_translation_en": model_translation_en,
