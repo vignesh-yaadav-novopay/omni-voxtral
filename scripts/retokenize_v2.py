@@ -95,6 +95,57 @@ def _shard_for_filename(filename: str) -> str:
     return filename[:2]
 
 
+def _output_paths(output_dir: str, source: str, lang: str, filename: str) -> tuple[Path, Path, Path]:
+    """Resolve the output directory and (.npy, .meta.json) paths for a given file."""
+    shard = _shard_for_filename(filename)
+    out_dir = Path(output_dir) / source / lang / shard
+    npy_path = out_dir / f"{filename}.npy"
+    meta_path = out_dir / f"{filename}.meta.json"
+    return out_dir, npy_path, meta_path
+
+
+def _already_tokenized(output_dir: str, source: str, lang: str, filename: str) -> bool:
+    """Resume-safety: skip files where both the .npy and a v2 sidecar already
+    exist on disk. The schema_version check prevents v1 stragglers from
+    masquerading as completed v2 work."""
+    from voxtral.data.sidecar import SCHEMA_VERSION
+
+    _, npy_path, meta_path = _output_paths(output_dir, source, lang, filename)
+    if not (npy_path.exists() and meta_path.exists()):
+        return False
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        return False
+    return int(meta.get("schema_version", 0)) == SCHEMA_VERSION
+
+
+def _index_already_tokenized(output_dir: str, source: str, lang: str, idx: int) -> bool:
+    """Cheaper resume check that skips BEFORE loading the dataset row.
+
+    The audio hash isn't known until we load the row, so we glob on the
+    `<lang>_<idx:08d>_*` prefix. This produces a false-positive only if the
+    dataset reorders rows, which neither FLEURS nor IndicVoices do — they
+    return rows by stable index.
+    """
+    from voxtral.data.sidecar import SCHEMA_VERSION
+
+    shard = f"{lang}_{idx:08d}"[:2]
+    out_dir = Path(output_dir) / source / lang / shard
+    if not out_dir.exists():
+        return False
+    matches = list(out_dir.glob(f"{lang}_{idx:08d}_*.meta.json"))
+    if not matches:
+        return False
+    try:
+        with open(matches[0], "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        return False
+    return int(meta.get("schema_version", 0)) == SCHEMA_VERSION
+
+
 def _save(
     tokens: torch.Tensor,
     metadata: dict,
@@ -108,13 +159,11 @@ def _save(
 ) -> None:
     from voxtral.data.sidecar import atomic_save_npy, write_metadata_sidecar
 
-    shard = _shard_for_filename(filename)
-    out_dir = Path(output_dir) / source / lang / shard
+    out_dir, npy_path, _meta_path = _output_paths(output_dir, source, lang, filename)
     out_dir.mkdir(parents=True, exist_ok=True)
-    npy_path = str(out_dir / f"{filename}.npy")
-    atomic_save_npy(tokens.detach().cpu().numpy(), npy_path)
+    atomic_save_npy(tokens.detach().cpu().numpy(), str(npy_path))
     write_metadata_sidecar(
-        npy_path,
+        str(npy_path),
         metadata,
         valid_token_mask=valid_token_mask,
         run_id=run_id,
@@ -180,8 +229,12 @@ def _process_fleurs(
         log.info(f"[fleurs:{lang}] loading {cfg}")
         ds = load_dataset("google/fleurs", cfg, split="train", trust_remote_code=True)
         n = min(len(ds), max_files_per_lang) if max_files_per_lang else len(ds)
+        resumed = 0
         for idx in range(n):
             if idx % world_size != rank:
+                continue
+            if _index_already_tokenized(output_dir, "fleurs", lang, idx):
+                resumed += 1
                 continue
             try:
                 row = ds[idx]
@@ -243,7 +296,7 @@ def _process_fleurs(
             except Exception as e:
                 skipped += 1
                 log.warning(f"[fleurs:{lang}] idx={idx}: {e}")
-        log.info(f"[fleurs:{lang}] done — saved={saved} skipped={skipped}")
+        log.info(f"[fleurs:{lang}] done — saved={saved} skipped={skipped} resumed={resumed}")
 
 
 # ---------------------------------------------------------------------------
@@ -285,12 +338,17 @@ def _process_indicvoices(
             log.warning(f"[iv:{lang}] HF load failed: {e}; need HF_TOKEN")
             continue
         idx = 0
+        resumed = 0
         for row in ds:
             if idx % world_size != rank:
                 idx += 1
                 continue
             if max_files_per_lang and saved >= max_files_per_lang * (idx // world_size + 1):
                 break
+            if _index_already_tokenized(output_dir, "iv", lang, idx):
+                resumed += 1
+                idx += 1
+                continue
             try:
                 audio = row["audio_filepath"]
                 arr = audio["array"]
@@ -345,7 +403,7 @@ def _process_indicvoices(
                 if skipped < 10:
                     log.warning(f"[iv:{lang}] idx={idx}: {e}")
             idx += 1
-        log.info(f"[iv:{lang}] done — saved={saved} skipped={skipped}")
+        log.info(f"[iv:{lang}] done — saved={saved} skipped={skipped} resumed={resumed}")
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +444,7 @@ def _process_youtube(
     if max_files:
         files = files[:max_files]
 
+    resumed = 0
     for idx, path in enumerate(files):
         if idx % world_size != rank:
             continue
@@ -406,6 +465,12 @@ def _process_youtube(
                 skipped += 1
                 continue
             if languages and lang not in languages and "all" not in languages:
+                continue
+
+            # Resume-safety: filename is `path.stem` for YouTube, so we can do
+            # the full path-based check (no audio_hash variability).
+            if _already_tokenized(output_dir, "yt", lang, path.stem):
+                resumed += 1
                 continue
 
             wave, sr = torchaudio.load(str(path))
@@ -461,7 +526,7 @@ def _process_youtube(
             if skipped < 10:
                 log.warning(f"[yt] {path.name}: {e}")
 
-    log.info(f"[yt] done — saved={saved} skipped={skipped}")
+    log.info(f"[yt] done — saved={saved} skipped={skipped} resumed={resumed}")
 
 
 def main():
