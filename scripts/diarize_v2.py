@@ -266,6 +266,7 @@ def main():
         files = files[: args.max_files]
     log.info(f"rank={args.rank}/{args.world_size} files={len(files)}")
     emitted = 0
+    processed = 0
     for idx, path in enumerate(files):
         if idx % args.world_size != args.rank:
             continue
@@ -282,8 +283,10 @@ def main():
             emitted += len(chunks)
         except Exception as e:
             log.warning(f"diarize_v2 failed on {path.name}: {e}")
-        if (idx + 1) % 20 == 0:
-            log.info(f"  rank={args.rank} processed={idx + 1} emitted={emitted}")
+        processed += 1
+        # Per-rank counter (not global idx) so every rank logs every 20 owned files.
+        if processed % 20 == 0:
+            log.info(f"  rank={args.rank} processed={processed} (idx {idx + 1}/{len(files)}) emitted={emitted}")
     log.info(f"done: emitted {emitted} dual-stream chunks")
 
 
