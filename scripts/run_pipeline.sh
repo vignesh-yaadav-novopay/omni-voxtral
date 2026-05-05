@@ -64,13 +64,18 @@ wait_for_phase() {
 }
 
 launch_indicvoices() {
-    STATUS "launching 1a-iv (IndicVoices, 4 shards × 1 GPU)"
+    # IV is huge (millions of samples). Cap per-lang so the run fits the
+    # multi-day budget locked in plan §6.Phase 1a (~4 days for FLEURS + IV).
+    # 5000/lang × 22 langs ≈ 110k total ≈ 27.5k/rank ≈ 38 hours at ~12/min/rank.
+    local IV_MAX_PER_LANG="${IV_MAX_PER_LANG:-5000}"
+    STATUS "launching 1a-iv (IndicVoices, 4 shards × 1 GPU, cap=${IV_MAX_PER_LANG}/lang)"
     SET_STATE 1a-iv running
     rm -f /tmp/omnivoxtral_gpu_*.lock
     for r in 0 1 2 3; do
         nohup env CUDA_VISIBLE_DEVICES=$r HF_HOME=/apps/hf-home UV_CACHE_DIR=/apps/uv-cache \
             uv run python scripts/retokenize_v2.py \
                 --dataset indicvoices --languages all --rank $r --world_size 4 \
+                --max_files_per_lang $IV_MAX_PER_LANG \
                 --output_dir data/tokens_v2 --device cuda:0 \
                 > logs/phase1a/iv/rank${r}.log 2>&1 &
     done
