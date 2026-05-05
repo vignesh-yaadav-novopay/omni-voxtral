@@ -30,6 +30,9 @@ dependencies = [
   "silero-vad>=6.2.1",
   "faster-whisper>=1.2.1",
   "jiwer>=4.0.0",
+  "pyannote-audio>=3.4.0",
+  "demucs>=4.0.1",
+  "ctc-forced-aligner>=1.0.2",
 ]
 
 [build-system]
