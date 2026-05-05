@@ -72,7 +72,28 @@ def main():
                    help="Source audio dir; we sample N files per `source_id` for the flag")
     p.add_argument("--output", default="data/source_music_flags.json")
     p.add_argument("--max_files", type=int, default=None)
+    p.add_argument("--rank", type=int, default=0,
+                   help="Shard index. Each rank emits its own partial JSON; merge with --merge afterwards.")
+    p.add_argument("--world_size", type=int, default=1)
+    p.add_argument("--merge", action="store_true",
+                   help="Merge per-rank shard JSONs (<output>.rank<r>.json) into the final output.")
     args = p.parse_args()
+
+    output_path = args.output
+
+    if args.merge:
+        # Merge phase: gather per-rank partials and write the unified file.
+        merged: dict[str, dict] = {}
+        for r in range(args.world_size):
+            shard_path = f"{output_path}.rank{r}.json"
+            if Path(shard_path).exists():
+                with open(shard_path, encoding="utf-8") as f:
+                    merged.update(json.load(f))
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(merged, output_path)
+        music_count = sum(1 for v in merged.values() if v.get("music_likely"))
+        log.info(f"merged {args.world_size} shards → {output_path}: {len(merged)} sources, {music_count} music_likely")
+        return
 
     src_root = Path(args.input_dir)
     files: list[Path] = []
@@ -89,20 +110,29 @@ def main():
         stem = f.stem.split("_")[0]
         by_source.setdefault(stem, []).append(f)
 
+    # Per-rank shard: every rank gets a deterministic disjoint slice of source_ids.
+    src_ids = sorted(by_source.keys())
     flags: dict[str, dict] = {}
-    for src_id, paths in by_source.items():
-        sample = paths[0]
+    log.info(f"rank={args.rank}/{args.world_size} sources={len(src_ids)} (this rank ~{len(src_ids)//max(args.world_size,1)})")
+    for i, src_id in enumerate(src_ids):
+        if i % args.world_size != args.rank:
+            continue
+        sample = by_source[src_id][0]
         try:
             result = detect_music_in_source(str(sample))
         except Exception as e:
             log.warning(f"music detect failed on {sample.name}: {e}")
             result = {"music_likely": False, "error": str(e)}
         flags[src_id] = result
+        if (len(flags)) % 50 == 0:
+            log.info(f"  rank={args.rank}: {len(flags)} sources processed")
 
-    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(flags, args.output)
+    # Each rank writes its own partial; --merge produces the final file.
+    shard_path = f"{output_path}.rank{args.rank}.json"
+    Path(shard_path).parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(flags, shard_path)
     music_count = sum(1 for v in flags.values() if v.get("music_likely"))
-    log.info(f"wrote {args.output}: {len(flags)} sources, {music_count} flagged music_likely")
+    log.info(f"rank={args.rank}: wrote {shard_path}: {len(flags)} sources, {music_count} music_likely")
 
 
 if __name__ == "__main__":
