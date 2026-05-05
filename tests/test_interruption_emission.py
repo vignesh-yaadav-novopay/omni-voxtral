@@ -80,10 +80,48 @@ def test_rate_above_seventy_percent_meets_goal4():
 @pytest.mark.gpu
 @pytest.mark.slow
 def test_model_emits_silence_during_user_speech():
-    """Full eval: needs VOXTRAL_CKPT + dual-stream synthetic prompt + generate."""
+    """Full eval: needs a dual-stream VOXTRAL_CKPT.
+
+    Constructs a synthetic user-side waveform with speech in [4s, 24s] (frames
+    100..600 at 5 Hz) and silence elsewhere. Generates 30s of model output.
+    Expects the model to emit `<|silence|>` (SP id 27) on ≥70% of model-stream
+    text positions while the user is speaking — Goal 4 acceptance.
+    """
     if not os.environ.get("VOXTRAL_CKPT"):
         pytest.skip("set VOXTRAL_CKPT to run the integration eval")
-    pytest.skip(
-        "Integration: pending scripts/generate.py refactor. The pure-logic "
-        "rate-computation tests above already exercise the metric definition."
+    if not torch.cuda.is_available():
+        pytest.skip("integration test needs CUDA")
+    if os.environ.get("DUAL_STREAM") != "true":
+        pytest.skip("integration test needs DUAL_STREAM=true (dual-stream checkpoint)")
+
+    from scripts.generate import generate_dual_stream, load_inference_pipeline
+    from voxtral.trainer.config import VoxtralTrainConfig
+
+    sr = 24_000
+    n = 30 * sr  # 30s
+    user = torch.zeros(n)
+    # Speech burst from 4s to 24s — sinusoid + noise so RMS clearly clears
+    # the speech_rms_threshold.
+    t = torch.arange(4 * sr, 24 * sr).float() / sr
+    user[4 * sr : 24 * sr] = 0.1 * torch.sin(2 * 3.1415 * 200 * t) + 0.02 * torch.randn(20 * sr)
+
+    config = VoxtralTrainConfig(dual_stream=True)
+    pipeline = load_inference_pipeline(os.environ["VOXTRAL_CKPT"], config=config, device="cuda:0")
+
+    out = generate_dual_stream(
+        pipeline,
+        user_audio=user.numpy(),
+        user_sample_rate=sr,
+        language="hin",
+        max_windows=150,
+        temperature=0.8,
+    )
+
+    rate = interruption_silence_emission_rate(
+        out["model_text_tokens"], out["user_speech_mask"], silence_token_id=27,
+    )
+    assert rate >= 0.70, (
+        f"Goal 4 acceptance fail: silence emission rate {rate:.2%} < 70% during "
+        f"user speech. (model_tokens={out['model_text_tokens'][:20].tolist()}, "
+        f"user_mask sum={int(out['user_speech_mask'].sum())})"
     )

@@ -330,6 +330,139 @@ def generate_audio(
     return waveform
 
 
+SILENCE_TOKEN_ID = 27  # SP control token <|silence|>; see data/tokenizer/omnivoxtral_sp.vocab.
+
+
+@torch.no_grad()
+def generate_dual_stream(
+    pipeline: InferencePipeline,
+    *,
+    user_audio: np.ndarray | torch.Tensor,
+    user_sample_rate: int,
+    language: str,
+    max_windows: int = 150,
+    temperature: float = 0.8,
+    top_k: Optional[int] = 250,
+    speech_rms_threshold: float = 0.005,
+) -> dict:
+    """Dual-stream generation: real user audio interleaved with autoregressive
+    model output. Used by `test_model_emits_silence_during_user_speech`.
+
+    The pipeline's model MUST be built with `dual_stream=True` (stride=42) — we
+    raise otherwise. Per the dual-stream layout, each 42-token window is:
+        [user_text(1), user_audio(20), model_text(1), model_audio(20)]
+
+    Returns a dict with:
+        waveform:           1-D float32 model-side audio at 24 kHz
+        model_text_tokens:  (max_windows,) int — emitted model_text per window
+        user_speech_mask:   (max_windows,) bool — True where user RMS > threshold
+        full_tokens:        the full interleaved sequence (debug)
+
+    The user_speech_mask is computed from the *raw* user_audio energy at each
+    200ms window — an honest "is the user speaking right now?" signal, not the
+    model's interpretation of it.
+    """
+    model = pipeline.model
+    if not getattr(model.config, "dual_stream", False):
+        raise ValueError(
+            "generate_dual_stream requires a model built with dual_stream=True. "
+            "Pass DUAL_STREAM=true via env or set VoxtralTrainConfig(dual_stream=True)."
+        )
+
+    stream_stride = model.config.stream_stride  # 21
+    stride = model.config.stride                # 42 (dual-stream)
+    num_q = model.config.num_codebooks          # 8
+    text_vocab = model.config.text_vocab_size
+    codebook_size = model.config.codebook_size
+    audio_per_window = model.config.text_to_audio_factor  # 20
+    device = pipeline.device
+
+    if isinstance(user_audio, np.ndarray):
+        user_audio_t = torch.from_numpy(user_audio.astype(np.float32))
+    else:
+        user_audio_t = user_audio.float()
+    if user_audio_t.dim() == 2 and user_audio_t.size(0) > 1:
+        user_audio_t = user_audio_t.mean(dim=0)
+    user_audio_t = user_audio_t.flatten()
+
+    # Energy-based user_speech_mask, one bool per 200ms window.
+    target_sr = 24_000
+    if user_sample_rate != target_sr:
+        user_audio_t = torchaudio.functional.resample(
+            user_audio_t.unsqueeze(0), user_sample_rate, target_sr
+        ).squeeze(0)
+    samples_per_window = target_sr // 5  # 4800 samples per 200ms
+    user_mask = torch.zeros(max_windows, dtype=torch.bool)
+    for w in range(max_windows):
+        chunk = user_audio_t[w * samples_per_window : (w + 1) * samples_per_window]
+        if chunk.numel() == 0:
+            break
+        rms = float(chunk.pow(2).mean().sqrt())
+        user_mask[w] = rms > speech_rms_threshold
+
+    # Pre-tokenize the user stream — we need its text + audio tokens to inject
+    # at each window's user-portion. This uses the *single-stream* tokenizer
+    # because we only want the per-window 21-token tuple, not the dual layout.
+    user_audio_in = user_audio_t.unsqueeze(0).unsqueeze(0).to(device).to(torch.float16)
+    user_tokens, _ = pipeline.tokenizer.encode(
+        user_audio_in, target_sr, language=language,
+    )
+    user_tokens_flat = user_tokens.squeeze(0).to(device)  # 1-D, stride-21 layout
+
+    context = torch.empty((1, 0), dtype=torch.long, device=device)
+    model_text_emitted = []
+
+    for win_idx in range(max_windows):
+        # 1) Inject the user-side window (21 tokens) from the pre-tokenized buffer.
+        u_start = win_idx * stream_stride
+        u_end = u_start + stream_stride
+        if u_end > user_tokens_flat.numel():
+            # User audio exhausted — pad with silence text token + zero codes.
+            user_window = torch.cat([
+                torch.tensor([SILENCE_TOKEN_ID], device=device),
+                torch.full((stream_stride - 1,), text_vocab, device=device, dtype=torch.long),
+            ])
+        else:
+            user_window = user_tokens_flat[u_start:u_end]
+        context = torch.cat([context, user_window.unsqueeze(0)], dim=1)
+
+        # 2) Generate model_text (1 token).
+        _hidden, logits = model._temporal_forward(context)
+        text_logits = logits[:, -1, :text_vocab]
+        m_text = model._sample_token(text_logits, temperature, top_k)
+        context = torch.cat([context, m_text], dim=1)
+        model_text_emitted.append(int(m_text.item()))
+
+        # 3) Generate model_audio (20 tokens) via depth.
+        audio_generated = 0
+        while audio_generated < audio_per_window:
+            hidden, _ = model._temporal_forward(context)
+            h_last = hidden[:, -1, :]
+            frame_tokens = model.depth.generate(h_last, temperature=temperature, top_k=top_k)
+            tokens_needed = min(num_q, audio_per_window - audio_generated)
+            for q in range(tokens_needed):
+                global_tok = text_vocab + q * codebook_size + frame_tokens[:, q]
+                context = torch.cat([context, global_tok.unsqueeze(1)], dim=1)
+            audio_generated += tokens_needed
+
+    # Decode the model-stream audio: extract the model_audio chunks across all
+    # windows, build a stride-21 single-stream layout, decode via Mimi.
+    full = context.squeeze(0)
+    model_only = []
+    for w in range(max_windows):
+        offset = w * stride + stream_stride  # start of model-side within window
+        model_only.append(full[offset : offset + stream_stride])
+    model_only_tokens = torch.cat(model_only).unsqueeze(0)  # (1, 21*max_windows)
+    waveform = tokens_to_audio(model_only_tokens, pipeline.tokenizer)
+
+    return {
+        "waveform": waveform.detach().cpu().float(),
+        "model_text_tokens": torch.tensor(model_text_emitted, dtype=torch.long),
+        "user_speech_mask": user_mask,
+        "full_tokens": full.detach().cpu(),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Generate audio from OmniVoxtral")
     parser.add_argument("--ckpt_path", type=str, default=None)

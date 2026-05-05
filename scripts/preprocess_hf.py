@@ -1,26 +1,32 @@
-"""Preprocess audio from HuggingFace datasets directly to training tokens.
+"""DEPRECATED — use scripts/retokenize_v2.py instead.
 
-Streams audio from FLEURS/IndicVoices → tokenizes with VoxtralTokenizer on GPU →
-saves as .npy files. No intermediate wav files needed.
+This is the v1 preprocessing entrypoint kept for back-compat reference. It
+writes .npy files with `np.save` (non-atomic) and no sidecar metadata, which
+the v2 trainer rejects (`require_sidecar=True` fails fast on these files).
 
-Usage:
-    # Process FLEURS (13 Indic languages, fully open):
-    CUDA_VISIBLE_DEVICES=0 uv run scripts/preprocess_hf.py --dataset fleurs --max_samples 1000
+The v2 replacement is `scripts/retokenize_v2.py`:
+- Per-call language tag (no silent English fallback — Defect 1)
+- Writes paired .meta.json sidecars (schema_version=2)
+- Atomic writes via os.replace
+- Resume-safe (`_index_already_tokenized` skips files from a prior run)
+- Multi-GPU sharding via --rank / --world_size
 
-    # Process IndicVoices (22 languages, needs HF_TOKEN):
-    CUDA_VISIBLE_DEVICES=0 uv run scripts/preprocess_hf.py --dataset indicvoices --max_samples 5000
+Usage of retokenize_v2:
+    # FLEURS, 4-GPU sharded:
+    for r in 0 1 2 3; do
+      CUDA_VISIBLE_DEVICES=$r uv run scripts/retokenize_v2.py \\
+          --dataset fleurs --languages all --rank $r --world_size 4 &
+    done
+    # IndicVoices: --dataset indicvoices --languages hi,ta,bn
 
-    # Process specific languages only:
-    CUDA_VISIBLE_DEVICES=0 uv run scripts/preprocess_hf.py --dataset fleurs --languages hi,kn,ta
-
-    # Dry run (count samples only):
-    uv run scripts/preprocess_hf.py --dataset fleurs --dry_run
+If you really need to run this legacy script, set ALLOW_V1_PREPROCESS=1.
 """
 
 import argparse
 import hashlib
 import logging
 import os
+import sys
 import time
 
 import dotenv
@@ -244,7 +250,8 @@ def preprocess_dataset(
             subdir = filename[:2]
             save_dir = os.path.join(lang_dir, subdir)
             os.makedirs(save_dir, exist_ok=True)
-            np.save(os.path.join(save_dir, f"{filename}.npy"), tokens.numpy())
+            from voxtral.data.sidecar import atomic_save_npy
+            atomic_save_npy(tokens.numpy(), os.path.join(save_dir, f"{filename}.npy"))
 
             lang_saved += 1
             total_saved += 1
@@ -265,6 +272,17 @@ def preprocess_dataset(
 
 
 def main():
+    if os.environ.get("ALLOW_V1_PREPROCESS") != "1":
+        print(
+            "scripts/preprocess_hf.py is deprecated. The v2 trainer rejects its "
+            "sidecar-less .npy output via require_sidecar.\n"
+            "Use scripts/retokenize_v2.py instead — see the module docstring for "
+            "exact usage, including 4-GPU sharding.\n"
+            "If you really need to run this anyway: ALLOW_V1_PREPROCESS=1 uv run scripts/preprocess_hf.py ...",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     parser = argparse.ArgumentParser(description="Preprocess HF datasets to training tokens")
     parser.add_argument("--dataset", type=str, required=True, choices=["fleurs", "indicvoices"])
     parser.add_argument("--languages", type=str, default=None, help="Comma-separated language codes (default: all)")

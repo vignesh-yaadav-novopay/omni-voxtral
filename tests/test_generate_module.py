@@ -70,6 +70,39 @@ def test_generate_audio_with_both_prompt_and_audio_raises():
     assert "pass at most one of prompt / prompt_audio" in src
 
 
+def test_silence_token_id_matches_sp_vocab():
+    """The dual-stream interruption test asserts model emits SP id 27. Make
+    sure that id still corresponds to <|silence|> in the trained tokenizer —
+    a vocab-rebuild that shifted control tokens would silently break Goal 4."""
+    from pathlib import Path
+
+    vocab_path = Path(__file__).resolve().parent.parent / "data" / "tokenizer" / "omnivoxtral_sp.vocab"
+    if not vocab_path.exists():
+        pytest.skip(f"SP vocab not found at {vocab_path}")
+    lines = vocab_path.read_text(encoding="utf-8").splitlines()
+    assert lines[27].split("\t")[0] == "<|silence|>", \
+        f"line 28 is {lines[27]!r} not <|silence|> — tokenizer rebuild?"
+
+    from scripts.generate import SILENCE_TOKEN_ID
+    assert SILENCE_TOKEN_ID == 27
+
+
+def test_generate_dual_stream_signature():
+    """generate_dual_stream is the entrypoint test_interruption_emission uses
+    once a dual-stream checkpoint is available. The test passes specific
+    kwargs — make sure they exist."""
+    import inspect
+    from scripts.generate import generate_dual_stream
+
+    sig = inspect.signature(generate_dual_stream)
+    expected = {
+        "pipeline", "user_audio", "user_sample_rate", "language",
+        "max_windows", "temperature", "top_k", "speech_rms_threshold",
+    }
+    assert expected.issubset(set(sig.parameters.keys()))
+    assert sig.parameters["language"].default is inspect.Parameter.empty
+
+
 def test_eval_wer_imports_generate_module():
     """eval_wer.py must successfully import scripts.generate at module load —
     if generate.py breaks, eval_wer.py should fail fast not silently no-op."""

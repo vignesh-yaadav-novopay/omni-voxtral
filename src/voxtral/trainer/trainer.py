@@ -1,8 +1,20 @@
+"""DEPRECATED — legacy single-stream SpeechLM trainer.
+
+The active OmniVoxtral training path is `voxtral.trainer.omni_trainer`
+(via `scripts/train_omni.py`). This module does NOT understand:
+- v2 sidecar metadata (no `valid_token_mask`, no `stream_layout`)
+- Per-call language tags (silently treats data as English-only)
+- Stride homogeneity guards (could mix stride-21 and stride-42 in one batch)
+
+Importing emits a DeprecationWarning. Set ALLOW_V1_TRAINER=1 to silence.
+"""
+
 import copy
 import dataclasses
 import datetime
 import os
 import time
+import warnings
 
 import dotenv
 import peft
@@ -13,6 +25,15 @@ import transformers as tr
 import voxtral.trainer.utils as utils
 import wandb
 from torch.nn.parallel import DistributedDataParallel
+
+
+if os.environ.get("ALLOW_V1_TRAINER") != "1":
+    warnings.warn(
+        "voxtral.trainer.trainer is deprecated; use voxtral.trainer.omni_trainer "
+        "(scripts/train_omni.py). Set ALLOW_V1_TRAINER=1 to silence.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 from voxtral.trainer.config import VoxtralTrainConfig
 from voxtral.trainer.data import VoxtralDataset
 from voxtral.trainer.test import test
