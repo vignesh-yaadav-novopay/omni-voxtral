@@ -302,6 +302,7 @@ def main():
         files = files[: args.max_files]
     log.info(f"rank={args.rank}/{args.world_size} files={len(files)}")
     total = 0
+    processed = 0
     for idx, path in enumerate(files):
         if idx % args.world_size != args.rank:
             continue
@@ -313,8 +314,14 @@ def main():
             silero_model=silero,
         )
         total += len(chunks)
-        if (idx + 1) % 50 == 0:
-            log.info(f"  processed {idx + 1} files, emitted {total} chunks")
+        processed += 1
+        # Log per-rank progress. Previously gated on `(idx+1) % 50 == 0`,
+        # which never fires for ranks where rank % world_size doesn't align
+        # with that modulo (e.g. world_size=4 with ranks 0 or 2 — no integer
+        # satisfies both idx%4==rank and idx%50==49). Switched to per-rank
+        # `processed` counter so every rank logs every 50 files it owns.
+        if processed % 50 == 0:
+            log.info(f"  processed {processed} files (idx {idx + 1}/{len(files)}), emitted {total} chunks")
     log.info(f"done: emitted {total} chunks across {len(files)} source files")
 
 
