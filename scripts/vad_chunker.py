@@ -50,6 +50,58 @@ TARGET_SR = 24_000
 SILERO_SR = 16_000  # Silero v6 expects 16kHz
 
 
+def _load_audio_any(path: str) -> tuple[torch.Tensor, int]:
+    """Load any audio container including AAC/.m4a (which soundfile rejects).
+
+    torchaudio.load() routes through soundfile by default, which lacks AAC
+    support — every YouTube .m4a file fails with "Format not recognised".
+    We detect that and fall back to PyAV (already installed via faster-whisper),
+    decoding via ffmpeg's native AAC decoder.
+
+    Returns (wav, sr). wav is float32, shape (channels, samples).
+    """
+    try:
+        return torchaudio.load(path)
+    except Exception as soundfile_err:
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in {".m4a", ".aac", ".mp4", ".webm", ".mkv", ".mov"}:
+            raise
+    # PyAV path — only invoked for AAC-family containers.
+    try:
+        import av
+    except ImportError as e:
+        raise RuntimeError(
+            "PyAV not installed; cannot decode .m4a/.aac. uv add av or "
+            "convert files to .wav first."
+        ) from e
+    container = av.open(path)
+    stream = next((s for s in container.streams if s.type == "audio"), None)
+    if stream is None:
+        raise RuntimeError(f"{path}: no audio stream found by PyAV")
+    sr = int(stream.rate)
+    channels: list[list[np.ndarray]] = []
+    for frame in container.decode(stream):
+        # frame.to_ndarray() returns shape (channels, samples) for planar formats.
+        arr = frame.to_ndarray()
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        for c in range(arr.shape[0]):
+            if c >= len(channels):
+                channels.append([])
+            channels[c].append(arr[c])
+    container.close()
+    if not channels:
+        raise RuntimeError(f"{path}: PyAV produced no audio frames")
+    arr = np.stack([np.concatenate(c) for c in channels], axis=0)
+    # PyAV gives int16 for most containers; normalize to float32 in [-1, 1].
+    if np.issubdtype(arr.dtype, np.integer):
+        info = np.iinfo(arr.dtype)
+        arr = arr.astype(np.float32) / max(abs(info.min), info.max)
+    else:
+        arr = arr.astype(np.float32)
+    return torch.from_numpy(arr), sr
+
+
 def _load_silero():
     from silero_vad import load_silero_vad
     return load_silero_vad(onnx=False)
@@ -108,7 +160,9 @@ def _atomic_write_json(obj: dict, path: str) -> None:
 
 
 def _atomic_write_wav(audio: torch.Tensor, sr: int, path: str) -> None:
-    tmp = f"{path}.tmp"
+    # torchaudio.save derives the format from the extension, so we keep .wav
+    # in the temp name and prepend `.partial` instead of using `.tmp`.
+    tmp = path[:-4] + ".partial.wav" if path.endswith(".wav") else f"{path}.partial.wav"
     torchaudio.save(tmp, audio, sr)
     os.replace(tmp, path)
 
@@ -125,7 +179,7 @@ def chunk_audio_file(
 ) -> list[dict]:
     """Process one source audio file. Returns list of chunk-meta dicts emitted."""
     try:
-        wav, sr = torchaudio.load(input_path)
+        wav, sr = _load_audio_any(input_path)
     except Exception as e:
         log.warning(f"failed to load {input_path}: {e}")
         return []
