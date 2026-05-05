@@ -534,8 +534,10 @@ if __name__ == "__main__":
         # EMA
         ema_gamma=16,
         ema_every=1024,
-        # Dataset
-        data_path="./data/tokens",
+        # Dataset — points at v2 corpus by default. The v1 ./data/tokens path
+        # was deleted (corrupted YT subset, English-only fallback) and the v2
+        # trainer rejects sidecar-less .npy files. Override via env: DATA_PATH=...
+        data_path="./data/tokens_v2",
         fake=True,  # Fake data by default for safety
         overfit=None,
         batch_size=2,
