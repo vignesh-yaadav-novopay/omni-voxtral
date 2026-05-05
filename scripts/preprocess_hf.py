@@ -109,11 +109,15 @@ def preprocess_sample(
     tokenizer: torch.nn.Module,
     device: torch.device,
     chunk_samples: int,
+    lang: str = "en",
 ) -> torch.Tensor | None:
     """Tokenize a single audio sample.
 
     Resamples to 24kHz, pads/truncates to chunk_samples, then encodes.
     Returns token tensor or None on failure.
+
+    `lang` is REQUIRED for v2 tokenizer (per-call language). Defaults to "en"
+    only for back-compat — callers that know the language should pass it.
     """
     try:
         waveform = torch.from_numpy(audio_array).float()
@@ -141,7 +145,9 @@ def preprocess_sample(
         # Cast to match tokenizer dtype (fp16)
         waveform = waveform.unsqueeze(0).half()
 
-        tokens = tokenizer.encode(waveform, MIMI_SR)
+        # v2: encode() returns (tokens, metadata); preprocess_hf.py is legacy and
+        # writes only tokens.npy here — full sidecar work lives in retokenize_v2.py.
+        tokens, _ = tokenizer.encode(waveform, MIMI_SR, language=lang)
         return tokens.cpu()
 
     except Exception as e:
@@ -227,7 +233,7 @@ def preprocess_dataset(
                 continue
 
             # Tokenize
-            tokens = preprocess_sample(audio_array, sr, tokenizer, torch.device(device), chunk_samples)
+            tokens = preprocess_sample(audio_array, sr, tokenizer, torch.device(device), chunk_samples, lang=lang)
             if tokens is None:
                 total_skipped += 1
                 continue

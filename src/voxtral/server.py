@@ -33,8 +33,9 @@ def process_audio(
     if waveform.shape[0] > 1:
         waveform = waveform.mean(dim=0, keepdim=True)
 
-    # Tokenize the audio
-    tokens = tokenizer.encode(waveform.unsqueeze(0), 24000)
+    # Tokenize the audio. Inference: assume English unless caller injected lang.
+    # v2 tokenizer.encode returns (tokens, metadata).
+    tokens, _ = tokenizer.encode(waveform.unsqueeze(0), 24000, language="en")
 
     # Generate continuation
     with torch.no_grad():

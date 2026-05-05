@@ -17,8 +17,17 @@ This layout enables:
 - Inner Monologue: text tokens for both user (transcription) and model (generation)
 - Interruption handling: overlapping non-silence in both streams
 
-Reference: Moshi paper Section 4.3, ARCHITECTURE.md Decision 3.
+v2 (Phase 4): silence regions in the non-active speaker stream are replaced
+*upstream* (in scripts/diarize_v2.py) with either -45 dB Gaussian noise or a
+real room-tone sample — the choice is set by Phase 0 experiment 2 via the
+`SILENCE_STRATEGY` env var. This avoids the silent-loop failure mode where
+Mimi maps zero-pad to a single repeated codebook ID that the model memorises.
+
+Reference: Moshi paper Section 4.3, ARCHITECTURE.md Decision 3, plan.md §6.Phase 4.
 """
+
+import os
+import typing
 
 import torch
 import torchaudio as ta
@@ -91,17 +100,20 @@ class DualStreamTokenizer(torch.nn.Module):
             factors=[1] * self.config.mimi_num_quantizers,
         )
 
-    def _encode_text_tokens(self, audio: torch.Tensor, sample_rate: int) -> torch.Tensor:
+    def _encode_text_tokens(
+        self,
+        audio: torch.Tensor,
+        sample_rate: int,
+        language: str | None = None,
+        task: str = "transcribe",
+    ) -> torch.Tensor:
         """Encode raw audio to text tokens via Whisper.
 
-        Args:
-            audio: (batch, 1, samples) at sample_rate
-
-        Returns:
-            text_tokens: (batch, num_text_frames)
+        v2: per-call `language` and `task` plumbed through. Required if the parent
+        config didn't lock a default at __init__.
         """
         x_16k = ta.functional.resample(audio, sample_rate, 16_000)[:, 0]
-        return self.whisper(x_16k, sample_rate=16_000)
+        return self.whisper(x_16k, sample_rate=16_000, language=language, task=task)
 
     @torch.no_grad()
     def encode(
@@ -109,6 +121,8 @@ class DualStreamTokenizer(torch.nn.Module):
         user_audio: torch.Tensor,
         model_audio: torch.Tensor,
         sample_rate: int,
+        language: str | None = None,
+        task: str = "transcribe",
     ) -> torch.Tensor:
         """Encode two audio streams into a dual-stream interleaved token sequence.
 
@@ -128,9 +142,9 @@ class DualStreamTokenizer(torch.nn.Module):
         device = self.device
 
         # Encode both streams
-        user_text = self._encode_text_tokens(user_audio, sample_rate)
+        user_text = self._encode_text_tokens(user_audio, sample_rate, language=language, task=task)
         user_audio_tok = self._encode_audio_tokens(user_audio.to(device))
-        model_text = self._encode_text_tokens(model_audio, sample_rate)
+        model_text = self._encode_text_tokens(model_audio, sample_rate, language=language, task=task)
         model_audio_tok = self._encode_audio_tokens(model_audio.to(device))
 
         # Apply 2-window delay (text leads audio by 2 windows)
@@ -228,6 +242,69 @@ class DualStreamTokenizer(torch.nn.Module):
             user_stream, factors=[1, self.text_to_audio_token_factor]
         )
         return self._decode_audio_from_tokens(user_audio)
+
+    @torch.no_grad()
+    def encode_with_metadata(
+        self,
+        user_audio: torch.Tensor,
+        model_audio: torch.Tensor,
+        sample_rate: int,
+        segments_metadata: list[dict],
+        language: str,
+        user_translation_en: str | None = None,
+        model_translation_en: str | None = None,
+        source_metadata: dict | None = None,
+        task: str = "transcribe",
+    ) -> tuple[torch.Tensor, dict]:
+        """Encode dual streams + return v2 sidecar metadata.
+
+        Args:
+            user_audio, model_audio: (batch, 1, samples) at 24kHz. The non-target
+                speaker is expected to already be replaced with the silence
+                strategy (noise floor or room-tone) by `scripts/diarize_v2.py`.
+            segments_metadata: per-speaker turn boundaries from diarization, used
+                only for the sidecar (not consumed by the encoder).
+            language: ISO code (required).
+
+        Returns:
+            tokens: (batch, seq_len) — dual-stream layout, stride 42.
+            metadata: v2 sidecar dict with `stream_layout="dual"` and stride 42.
+        """
+        tokens = self.encode(user_audio, model_audio, sample_rate, language=language, task=task)
+        num_samples = int(user_audio.size(-1))
+        meta: dict[str, typing.Any] = {
+            "schema_version": 2,
+            "preprocessing_version": "v2.0",
+            "language": language,
+            "language_method": "caller_provided",
+            "language_confidence": 1.0,
+            "task": task,
+            "translation_en": None,
+            "duration_s": float(num_samples / sample_rate),
+            "sample_rate": int(sample_rate),
+            "num_channels": 2,
+            "num_speakers": max(1, len({s.get("speaker") for s in segments_metadata})),
+            "speaker_segments": [dict(s) for s in segments_metadata],
+            "stream_layout": "dual",
+            "tokenizer_config": {
+                "sp_model": (
+                    os.path.basename(self.config.sp_tokenizer_path)
+                    if self.config.sp_tokenizer_path
+                    else None
+                ),
+                "text_hz": self.config.text_hz,
+                "mimi_num_quantizers": self.config.mimi_num_quantizers,
+                "stride": self.dual_stride,
+            },
+            "token_count": int(tokens.size(-1)),
+            "token_range": [int(tokens.min()), int(tokens.max())],
+            "valid_token_mask": None,
+            "user_translation_en": user_translation_en,
+            "model_translation_en": model_translation_en,
+        }
+        if source_metadata:
+            meta.update(source_metadata)
+        return tokens, meta
 
     @torch.no_grad()
     def extract_text_tokens(self, z: torch.Tensor) -> dict[str, torch.Tensor]:

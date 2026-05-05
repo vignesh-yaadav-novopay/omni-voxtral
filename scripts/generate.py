@@ -232,16 +232,12 @@ def main():
     if args.ckpt_path:
         load_checkpoint(model, args.ckpt_path, device)
 
-    # EMBNORM-1: Rescale speech embeddings to match text embedding norms.
-    # Speech embeddings are ~4x larger than text, causing attention dominance
-    # and repetitive generation. Rescale each to match text mean norm.
-    embed_w = model.temporal.get_input_embeddings().weight
-    text_vocab = config.voxtral_tokenizer_config.text_vocab_size
-    with torch.no_grad():
-        text_mean_norm = embed_w[:text_vocab].norm(dim=1).mean()
-        speech_norms = embed_w[text_vocab:].norm(dim=1, keepdim=True).clamp(min=1e-8)
-        embed_w[text_vocab:] *= text_mean_norm / speech_norms
-        print(f"  Embedding rescaling: speech norms → {text_mean_norm:.4f} (was ~{(speech_norms.mean() * text_mean_norm / text_mean_norm).item():.4f})")
+    # EMBNORM-1: DISABLED — rescaling embeddings at inference breaks the model.
+    # The model was trained with original embedding norms. Changing them at
+    # inference produces inputs the model has never seen, causing immediate
+    # degradation after the prompt tokens run out.
+    # If embedding norm mismatch is a problem, fix it in training (init_embeddings.py),
+    # not at inference.
 
     # Load prompt if provided
     prompt = None
