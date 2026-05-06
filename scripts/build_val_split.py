@@ -18,6 +18,9 @@ Two-tier stratified sampling:
 - YT files filtered by `min_lid_confidence` (default 0.7, matches LLD.md:540).
   FLEURS / IV sidecars have no `language_confidence` field — they're gold-labeled
   and treated as confidence 1.0.
+- Files with a non-null `quarantine_reason` (e.g., `repetition_loop` from
+  pathological tokenizer output) are dropped from val. They must not contaminate
+  any val_loss number.
 - Tier-1 languages absent from the corpus are logged into `missing_tier1` in the
   output JSON. Underfilled languages (< min_per_lang after sampling) into `underfilled`.
 
@@ -133,13 +136,18 @@ def discover_files(
         return {}, {}
 
     by_lang_src: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
-    stats = {"total": 0, "no_meta": 0, "no_lang": 0, "no_source": 0, "low_lid": 0}
+    stats = {"total": 0, "no_meta": 0, "no_lang": 0, "no_source": 0,
+             "low_lid": 0, "quarantined": 0}
 
     for npy in root.rglob("*.npy"):
         stats["total"] += 1
         meta = _read_meta(npy)
         if meta is None:
             stats["no_meta"] += 1
+            continue
+        # Quarantined files (e.g., repetition_loop) must NEVER land in val.
+        if meta.get("quarantine_reason"):
+            stats["quarantined"] += 1
             continue
         lang = meta.get("language")
         if not lang:
@@ -160,7 +168,8 @@ def discover_files(
     sources = sorted({s for d in by_lang_src.values() for s in d})
     log.info(
         f"discovered {stats['total']} .npy files; "
-        f"skipped: {stats['no_meta']} no_meta, {stats['no_lang']} no_lang, "
+        f"skipped: {stats['no_meta']} no_meta, {stats['quarantined']} quarantined, "
+        f"{stats['no_lang']} no_lang, "
         f"{stats['low_lid']} low_lid (<{min_lid_confidence}), "
         f"{stats['no_source']} no_source; "
         f"{len(by_lang_src)} languages × {len(sources)} sources: {sources}"
