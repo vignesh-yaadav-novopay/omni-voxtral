@@ -276,6 +276,20 @@ def encode_prompt_audio(
     tokens = tokens.squeeze(0)
     if n_tokens is not None and tokens.numel() > n_tokens:
         tokens = tokens[:n_tokens]
+    # Align to a full window-group boundary so tokens_to_audio's reshape
+    # to (1, -1, audio_per_window) succeeds. The Mimi decode also requires
+    # audio-token count divisible by num_quantizers (8). For stride=21 +
+    # audio_per_window=20 + num_q=8, the LCM gives a 42-token boundary
+    # (2 windows = 40 audio tokens = 5 Mimi frames).
+    from math import gcd
+    stride = tokenizer.text_to_audio_token_factor + 1
+    audio_per_window = tokenizer.text_to_audio_token_factor
+    num_q = tokenizer.config.mimi_num_quantizers
+    window_group = num_q // gcd(audio_per_window, num_q)
+    boundary = stride * window_group
+    aligned_len = (tokens.numel() // boundary) * boundary
+    if aligned_len > 0 and aligned_len < tokens.numel():
+        tokens = tokens[:aligned_len]
     return tokens
 
 
